@@ -113,3 +113,81 @@ export function corsPreflight() {
     },
   });
 }
+// ─────────────────────────────────────────────────────────────
+// 记忆家云端 bundle 补丁 · 追加到 functions/api/_lib.js 末尾
+// 依赖本文件里已有的 sbHeaders / sbInsertMemory / embed 等函数
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 按 metadata.source + metadata.source_id 查一条记忆，用来避免重复同步。
+ */
+export async function sbFindMemoryBySource(env, source, sourceId) {
+  if (!source || !sourceId) return null;
+
+  const url = new URL(env.SUPABASE_URL + '/rest/v1/iw_memories');
+  url.searchParams.set('select', 'id,content,type,metadata,created_at,updated_at');
+  url.searchParams.set('metadata->>source', 'eq.' + source);
+  url.searchParams.set('metadata->>source_id', 'eq.' + sourceId);
+  url.searchParams.set('limit', '1');
+
+  const r = await fetch(url.toString(), {
+    method: 'GET',
+    headers: sbHeaders(env),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('sbFindMemoryBySource ' + r.status + ': ' + t.slice(0, 300));
+  }
+
+  const rows = await r.json();
+  return rows[0] || null;
+}
+
+/**
+ * 更新一条记忆。用于“同步时发现 source_id 已存在，就覆盖内容/metadata/embedding”。
+ */
+export async function sbUpdateMemory(env, id, row) {
+  const r = await fetch(env.SUPABASE_URL + '/rest/v1/iw_memories?id=eq.' + encodeURIComponent(id), {
+    method: 'PATCH',
+    headers: { ...sbHeaders(env), Prefer: 'return=representation' },
+    body: JSON.stringify({
+      ...row,
+      updated_at: new Date().toISOString(),
+    }),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('sbUpdateMemory ' + r.status + ': ' + t.slice(0, 300));
+  }
+
+  const data = await r.json();
+  return data[0];
+}
+
+/**
+ * 根据一组 id 把完整行取回来。
+ * 你的 iw_match_memories RPC 目前只返回 content/type/similarity 等轻量字段，
+ * bundle builder 需要 metadata，所以这里再补查一次表。
+ */
+export async function sbSelectMemoriesByIds(env, ids) {
+  const cleanIds = [...new Set((ids || []).filter(x => x != null))];
+  if (!cleanIds.length) return [];
+
+  const url = new URL(env.SUPABASE_URL + '/rest/v1/iw_memories');
+  url.searchParams.set('select', 'id,content,type,metadata,created_at,updated_at');
+  url.searchParams.set('id', 'in.(' + cleanIds.join(',') + ')');
+
+  const r = await fetch(url.toString(), {
+    method: 'GET',
+    headers: sbHeaders(env),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('sbSelectMemoriesByIds ' + r.status + ': ' + t.slice(0, 300));
+  }
+
+  return r.json();
+}
