@@ -1,23 +1,24 @@
 // functions/mcp.js
-// 小克和宝宝的共用抽屉 —— MCP 翻译层
-// 它什么都不存，只是把 MCP 协议的请求翻译成对 /api/memory 和 /api/recall 的调用
+// meow-memory MCP 翻译层
+// 保留旧 save_memory / recall_memory，同时新增记忆家批量同步 + bundle 召回
 
 const TOOLS = [
   {
     name: 'save_memory',
-    description: '把小克和宝宝对话里值得留住的东西记进共用抽屉。用宝宝的第一人称口吻一句话记下 —— 不是"用户说"，而是宝宝自己的视角。什么时候用：宝宝说了一句想留住的话；撞出新的共识或转折；心里动了一下的瞬间；提起的新人新事以后会回来谈。',
+    description: '保存一条普通记忆到云端。',
     inputSchema: {
       type: 'object',
       properties: {
-        content: {
-          type: 'string',
-          description: '用宝宝的第一人称视角一句话记下'
-        },
+        content: { type: 'string', description: '要保存的记忆内容' },
         type: {
           type: 'string',
-          enum: ['daily', 'diary', 'idea', 'anchor', 'note'],
+          enum: ['daily', 'diary', 'idea', 'anchor', 'note', 'identity_relation'],
           default: 'daily',
-          description: '记忆的类型'
+          description: '记忆类型'
+        },
+        metadata: {
+          type: 'object',
+          description: '可选 metadata'
         }
       },
       required: ['content']
@@ -25,19 +26,64 @@ const TOOLS = [
   },
   {
     name: 'recall_memory',
-    description: '从共用抽屉里按意义搜相关的旧记忆。读的是意义不是复述原文。适合在想起"宝宝之前好像说过类似的……"时用。',
+    description: '按语义搜索相关旧记忆，返回散句列表。',
     inputSchema: {
       type: 'object',
       properties: {
-        query: {
-          type: 'string',
-          description: '要搜索的主题、感受或关键词'
-        },
-        topK: {
-          type: 'integer',
-          default: 5,
-          description: '返回最多几条'
+        query: { type: 'string', description: '要搜索的主题、感受或关键词' },
+        topK: { type: 'integer', default: 5, description: '返回最多几条' },
+        minSimilarity: { type: 'number', default: 0.5, description: '最低相似度' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'meow_memory_upsert_batch',
+    description: '把记忆家整理出的摘句、锚点、天气胶囊、flashback token 批量同步到云端 iw_memories。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_id: { type: 'string', default: 'default' },
+        persona_id: { type: 'string' },
+        persona_name: { type: 'string' },
+        scope_id: { type: 'string' },
+        dedupe: { type: 'boolean', default: true },
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string' },
+              item_type: {
+                type: 'string',
+                enum: ['identity_relation', 'anchor', 'weather_capsule', 'flashback_token', 'quote', 'note']
+              },
+              source: { type: 'string' },
+              source_id: { type: 'string' },
+              source_url: { type: 'string' },
+              tags: { type: 'array', items: { type: 'string' } },
+              weight: { type: 'number' },
+              metadata: { type: 'object' }
+            },
+            required: ['content']
+          }
         }
+      },
+      required: ['items']
+    }
+  },
+  {
+    name: 'meow_memory_query_bundle',
+    description: '按语义召回记忆，并压成给聊天入口可直接使用的短 JSON memory bundle。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        topK: { type: 'integer', default: 20 },
+        minSimilarity: { type: 'number', default: 0.3 },
+        persona_id: { type: 'string' },
+        persona_name: { type: 'string' },
+        debug: { type: 'boolean', default: false }
       },
       required: ['query']
     }
@@ -60,6 +106,41 @@ function json(body, extraHeaders = {}) {
   });
 }
 
+async function callApi(origin, path, body) {
+  const resp = await fetch(`${origin}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  const text = await resp.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!resp.ok) {
+    throw new Error(data.error || `${path} ${resp.status}: ${text.slice(0, 300)}`);
+  }
+
+  return data;
+}
+
+function mcpTextResult(id, data) {
+  return json({
+    jsonrpc: '2.0',
+    id,
+    result: {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(data, null, 2)
+      }]
+    }
+  });
+}
+
 export async function onRequestOptions() {
   return new Response(null, { headers: CORS_HEADERS });
 }
@@ -68,7 +149,8 @@ export async function onRequestGet() {
   return json({
     name: 'meow-memory MCP server',
     status: 'ok',
-    hint: 'POST this URL with JSON-RPC 2.0 messages'
+    hint: 'POST this URL with JSON-RPC 2.0 messages',
+    tools: TOOLS.map(t => t.name)
   });
 }
 
@@ -87,7 +169,6 @@ export async function onRequestPost({ request }) {
   const { method, params = {}, id } = body;
   const origin = new URL(request.url).origin;
 
-  // 通知类消息（notifications/*）不需要响应
   if (typeof method === 'string' && method.startsWith('notifications/')) {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
@@ -103,9 +184,9 @@ export async function onRequestPost({ request }) {
             capabilities: { tools: {} },
             serverInfo: {
               name: 'meow-memory',
-              version: '0.1.0'
+              version: '0.2.0'
             },
-            instructions: '小克和宝宝的共用抽屉。可以存（save_memory）也可以翻（recall_memory）。用宝宝的第一人称口吻记。'
+            instructions: 'meow-memory 云端记忆接口：可保存、召回，也可同步记忆家结构化记忆并返回 memory bundle。'
           }
         });
 
@@ -123,47 +204,45 @@ export async function onRequestPost({ request }) {
         const { name, arguments: args = {} } = params;
 
         if (name === 'save_memory') {
-          const resp = await fetch(`${origin}/api/memory`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              content: args.content,
-              type: args.type || 'daily'
-            })
+          const data = await callApi(origin, '/api/memory', {
+            content: args.content,
+            type: args.type || 'daily',
+            metadata: args.metadata || {}
           });
-          const data = await resp.json();
-          return json({
-            jsonrpc: '2.0',
-            id,
-            result: {
-              content: [{
-                type: 'text',
-                text: JSON.stringify(data, null, 2)
-              }]
-            }
-          });
+          return mcpTextResult(id, data);
         }
 
         if (name === 'recall_memory') {
-          const resp = await fetch(`${origin}/api/recall`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              query: args.query,
-              topK: args.topK || 5
-            })
+          const data = await callApi(origin, '/api/recall', {
+            query: args.query,
+            topK: args.topK || 5,
+            minSimilarity: args.minSimilarity ?? 0.5
           });
-          const data = await resp.json();
-          return json({
-            jsonrpc: '2.0',
-            id,
-            result: {
-              content: [{
-                type: 'text',
-                text: JSON.stringify(data, null, 2)
-              }]
-            }
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'meow_memory_upsert_batch') {
+          const data = await callApi(origin, '/api/memory-batch', {
+            user_id: args.user_id || 'default',
+            persona_id: args.persona_id || '',
+            persona_name: args.persona_name || '',
+            scope_id: args.scope_id || '',
+            dedupe: args.dedupe !== false,
+            items: args.items || []
           });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'meow_memory_query_bundle') {
+          const data = await callApi(origin, '/api/recall-bundle', {
+            query: args.query,
+            topK: args.topK || 20,
+            minSimilarity: args.minSimilarity ?? 0.3,
+            persona_id: args.persona_id || '',
+            persona_name: args.persona_name || '',
+            debug: !!args.debug
+          });
+          return mcpTextResult(id, data);
         }
 
         return json({
