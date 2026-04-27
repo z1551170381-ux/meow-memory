@@ -1,4 +1,8 @@
 // 共享工具:embedding 调用 + Supabase 客户端
+//
+// ★ v2 (方案 B · 织哥共谋 2026-04-27):
+// - sbMatchMemories 新增 filterPersona 入参,传给 RPC 的 filter_persona
+// - sbInsertMemory 自动透传 persona_id 字段(由调用方传入)
 
 /**
  * 调用硅基流动 embedding API
@@ -47,6 +51,11 @@ export function sbHeaders(env) {
 
 /**
  * 调用 Supabase RPC 函数(iw_match_memories)
+ * @param {object} opts
+ * @param {number} opts.threshold - 最小相似度阈值
+ * @param {number} opts.topK - 返回多少条
+ * @param {number|null} opts.excludeId - 排除某个 id (避免查到自己)
+ * @param {string|null} opts.filterPersona - ★ 按 persona 过滤;null = 跨 scope 查
  */
 export async function sbMatchMemories(env, queryEmbedding, opts = {}) {
   const body = {
@@ -54,6 +63,7 @@ export async function sbMatchMemories(env, queryEmbedding, opts = {}) {
     match_threshold: opts.threshold ?? 0.5,
     match_count: opts.topK ?? 3,
     exclude_id: opts.excludeId ?? null,
+    filter_persona: opts.filterPersona ?? null,  // ★ 新增:对应 RPC 函数同名入参
   };
   const r = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/iw_match_memories', {
     method: 'POST',
@@ -69,6 +79,7 @@ export async function sbMatchMemories(env, queryEmbedding, opts = {}) {
 
 /**
  * 插入一条记忆
+ * row 必须含: { content, type, persona_id, embedding } + 可选 metadata
  */
 export async function sbInsertMemory(env, row) {
   const r = await fetch(env.SUPABASE_URL + '/rest/v1/iw_memories', {
@@ -113,6 +124,7 @@ export function corsPreflight() {
     },
   });
 }
+
 // ─────────────────────────────────────────────────────────────
 // 记忆家云端 bundle 补丁 · 追加到 functions/api/_lib.js 末尾
 // 依赖本文件里已有的 sbHeaders / sbInsertMemory / embed 等函数
