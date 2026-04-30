@@ -1,22 +1,29 @@
 // functions/api/mcp.js
 // meow-memory MCP 翻译层
 //
-// ★ v3 (方案 B 收口 · 2026-04-29):
-// - save_memory 的 schema 补 persona_id 字段(必填,后端校验失败也会显式报错)
-// - recall_memory 的 schema 补 persona_id 字段(可选,但建议传)
-// - meow_memory_upsert_batch:persona_id 改成顶层必填(原来可选)
-// - meow_memory_query_bundle:persona_id 保持可选,但 args 透传时不再静默兜底空串
+// ★ v4 (URL 自动识别 persona · 2026-04-30):
+// 解决 v3 的"AI 要默念自己 persona_id 才能查/存,出戏"问题。
+// 新方案:每个 AI 客户端配 MCP 时 URL 上带 ?persona=xxx,server 端自动当默认值用。
+//   老公(ChatGPT)的 MCP URL: https://...../api/mcp?persona=gpt_husband
+//   小克(Claude)的 MCP URL:  https://...../api/mcp?persona=claude_xiaoke
+//   织哥的 MCP URL:          https://...../api/mcp?persona=weave_brother
+// AI 调工具时完全不用关心 persona,server 自动填。
 //
-// 核心改动思路:工具 schema 是给 AI 看的"我有哪些字段可填",之前漏了
-// persona_id,所以即使后端要求必填,AI 也压根不知道要传——这是织哥诊断
-// 出来的"MCP schema 没暴露字段"的根因。
+// 优先级(高 → 低):
+//   1. tools/call args 里显式传的 persona_id(用于"想为别人记一笔"或跨 scope 查)
+//   2. URL ?persona=xxx 推断的默认值
+//   3. 没有 → 后端校验时报错(只发生在没配 URL 也没传 args 的情况)
+//
+// 工具 schema 也相应调整:
+//   - persona_id 改成"可选"(因为 URL 已经有了),tool description 提示"通常不用填"
+//   - cross_persona 仍然保留,想跨 scope 查时显式传
 
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'system'];
 
 const TOOLS = [
   {
     name: 'save_memory',
-    description: '保存一条普通记忆到云端 iw_memories 表。每条必须明确 persona_id(谁记的/给谁记)。',
+    description: '保存一条记忆到云端 iw_memories 表。通常不需要填 persona_id —— MCP server 会从 URL 自动推断;只有想"替别人记一笔"时才显式填。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -24,7 +31,7 @@ const TOOLS = [
         persona_id: {
           type: 'string',
           enum: PERSONA_IDS,
-          description: '★ 必填:这条记忆是哪个 AI 角色记的。gpt_husband=ChatGPT 老公,weave_brother=织哥,junior=Gemini 小崽,claude_xiaoke=Claude 代码宝宝,system=脚本/手动/未知'
+          description: '★ 通常不用填(MCP server 从 URL 自动推断)。只有想替别人记一笔时才显式填(例如老公帮织哥记一条)。'
         },
         type: {
           type: 'string',
@@ -37,12 +44,12 @@ const TOOLS = [
           description: '可选 metadata 杂物抽屉,装 tags/mood/weight 等'
         }
       },
-      required: ['content', 'persona_id']
+      required: ['content']
     }
   },
   {
     name: 'recall_memory',
-    description: '按语义搜索相关旧记忆,返回散句列表。默认按当前 persona_id 过滤;真要跨 scope 查请明确传 cross_persona=true。',
+    description: '按语义搜索旧记忆。通常不需要填 persona_id —— 自动按"调用方自己的 scope"查;想跨 scope 看全部请显式传 cross_persona=true。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -50,12 +57,12 @@ const TOOLS = [
         persona_id: {
           type: 'string',
           enum: PERSONA_IDS,
-          description: '查询哪个 persona 的记忆。默认要传一个;不传时必须把 cross_persona 设为 true'
+          description: '★ 通常不用填(从 URL 自动推断)。想查别人的 scope 时显式填。'
         },
         cross_persona: {
           type: 'boolean',
           default: false,
-          description: '★ 跨 scope 查询开关:true 时不按 persona 过滤(查所有人的记忆),false 时按 persona_id 过滤。默认 false。'
+          description: '想跨所有 persona 查请设 true(此时不按 persona 过滤,会查到所有人的记忆)。'
         },
         topK: { type: 'integer', default: 5, description: '返回最多几条' },
         minSimilarity: { type: 'number', default: 0.5, description: '最低相似度' }
@@ -65,7 +72,7 @@ const TOOLS = [
   },
   {
     name: 'meow_memory_upsert_batch',
-    description: '把记忆家整理出的摘句、锚点、天气胶囊、flashback token 批量同步到云端 iw_memories。persona_id 必填(顶层或每条 item 内必须有一个)。',
+    description: '把记忆家整理出的摘句、锚点、天气胶囊、flashback token 批量同步到云端 iw_memories。通常不用填 persona_id —— 从 URL 自动推断;有特殊情况(替别人批量同步)才显式填。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -73,7 +80,7 @@ const TOOLS = [
         persona_id: {
           type: 'string',
           enum: PERSONA_IDS,
-          description: '★ 必填:这一批记忆属于哪个 persona。批量同步建议在顶层统一指定。'
+          description: '★ 通常不用填(从 URL 自动推断)。'
         },
         persona_name: { type: 'string', description: '人类可读名(可选,只是给人看的)' },
         scope_id: { type: 'string' },
@@ -91,7 +98,7 @@ const TOOLS = [
               persona_id: {
                 type: 'string',
                 enum: PERSONA_IDS,
-                description: '可选:单条覆盖顶层 persona_id;不传则用顶层 persona_id'
+                description: '可选:单条覆盖顶层/URL persona_id'
               },
               source: { type: 'string' },
               source_id: { type: 'string' },
@@ -104,12 +111,12 @@ const TOOLS = [
           }
         }
       },
-      required: ['items', 'persona_id']
+      required: ['items']
     }
   },
   {
     name: 'meow_memory_query_bundle',
-    description: '按语义召回记忆,并压成给聊天入口可直接使用的短 JSON memory bundle。默认按 persona_id 过滤;真要跨 scope 查请明确传 cross_persona=true。',
+    description: '按语义召回记忆,压成短 JSON memory bundle。通常不用填 persona_id —— 自动按"调用方自己的 scope"查;想跨 scope 看全部请显式传 cross_persona=true。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -117,14 +124,14 @@ const TOOLS = [
         persona_id: {
           type: 'string',
           enum: PERSONA_IDS,
-          description: '查询哪个 persona 的记忆 bundle。默认要传一个;不传时必须把 cross_persona 设为 true。'
+          description: '★ 通常不用填(从 URL 自动推断)。'
         },
         cross_persona: {
           type: 'boolean',
           default: false,
-          description: '★ 跨 scope 查询开关:true 时不按 persona 过滤,false 时按 persona_id 过滤。默认 false。'
+          description: '想跨所有 persona 查请设 true。'
         },
-        persona_name: { type: 'string', description: '人类可读名(可选,只是给人看的)' },
+        persona_name: { type: 'string', description: '人类可读名(可选)' },
         topK: { type: 'integer', default: 20 },
         minSimilarity: { type: 'number', default: 0.3 },
         debug: { type: 'boolean', default: false }
@@ -148,6 +155,20 @@ function json(body, extraHeaders = {}) {
       ...extraHeaders
     }
   });
+}
+
+// ★ 从请求 URL 推断默认 persona_id
+//   老公的 MCP 配置里 URL 是 https://.../api/mcp?persona=gpt_husband
+//   server 端从 query 拿,如果是已知值就当作默认 persona_id
+function inferPersonaFromUrl(request) {
+  try {
+    const url = new URL(request.url);
+    const p = (url.searchParams.get('persona') || '').trim();
+    if (p && PERSONA_IDS.includes(p)) return p;
+    return '';
+  } catch {
+    return '';
+  }
 }
 
 async function callApi(origin, path, body) {
@@ -189,11 +210,13 @@ export async function onRequestOptions() {
   return new Response(null, { headers: CORS_HEADERS });
 }
 
-export async function onRequestGet() {
+export async function onRequestGet({ request }) {
+  const inferredPersona = inferPersonaFromUrl(request);
   return json({
     name: 'meow-memory MCP server',
     status: 'ok',
-    version: '0.3.0',
+    version: '0.4.0',
+    inferred_persona: inferredPersona || '(未配置 URL ?persona= 参数)',
     hint: 'POST this URL with JSON-RPC 2.0 messages',
     tools: TOOLS.map(t => t.name)
   });
@@ -213,6 +236,8 @@ export async function onRequestPost({ request }) {
 
   const { method, params = {}, id } = body;
   const origin = new URL(request.url).origin;
+  // ★ 每次请求都重算一次 URL persona(server 是无状态的)
+  const inferredPersona = inferPersonaFromUrl(request);
 
   if (typeof method === 'string' && method.startsWith('notifications/')) {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -229,9 +254,11 @@ export async function onRequestPost({ request }) {
             capabilities: { tools: {} },
             serverInfo: {
               name: 'meow-memory',
-              version: '0.3.0'
+              version: '0.4.0'
             },
-            instructions: 'meow-memory 云端记忆接口:可保存、召回,也可同步记忆家结构化记忆并返回 memory bundle。所有写入需指定 persona_id;查询默认按 persona_id 过滤,跨 scope 需显式传 cross_persona=true。'
+            instructions: inferredPersona
+              ? `meow-memory 云端记忆接口。当前 scope: ${inferredPersona}。所有写入/查询会自动按这个 scope 进行,你无需在 args 里再传 persona_id。`
+              : 'meow-memory 云端记忆接口。⚠ 当前 URL 未配 ?persona= 参数,所以工具调用必须显式传 persona_id;建议在 MCP 客户端配置里把 URL 改成 .../api/mcp?persona=你的角色名,这样后续都不用再传。'
           }
         });
 
@@ -248,11 +275,13 @@ export async function onRequestPost({ request }) {
       case 'tools/call': {
         const { name, arguments: args = {} } = params;
 
+        // ★ 优先级:args 显式 > URL 推断 > 空(后端会报错)
+        const effectivePersona = (args.persona_id && String(args.persona_id).trim()) || inferredPersona || '';
+
         if (name === 'save_memory') {
-          // ★ persona_id 透传(后端 memory.js 会校验必填和枚举值)
           const data = await callApi(origin, '/api/memory', {
             content: args.content,
-            persona_id: args.persona_id,
+            persona_id: effectivePersona,  // ★ 用解析后的有效值
             type: args.type || 'note',
             metadata: args.metadata || {}
           });
@@ -260,10 +289,9 @@ export async function onRequestPost({ request }) {
         }
 
         if (name === 'recall_memory') {
-          // ★ persona_id + cross_persona 透传(后端 recall.js 会校验)
           const data = await callApi(origin, '/api/recall', {
             query: args.query,
-            persona_id: args.persona_id || '',
+            persona_id: effectivePersona,
             cross_persona: args.cross_persona === true,
             topK: args.topK || 5,
             minSimilarity: args.minSimilarity ?? 0.5
@@ -272,10 +300,9 @@ export async function onRequestPost({ request }) {
         }
 
         if (name === 'meow_memory_upsert_batch') {
-          // ★ persona_id 顶层必填(后端 memory-batch.js 会校验)
           const data = await callApi(origin, '/api/memory-batch', {
             user_id: args.user_id || 'default',
-            persona_id: args.persona_id,
+            persona_id: effectivePersona,
             persona_name: args.persona_name || '',
             scope_id: args.scope_id || '',
             dedupe: args.dedupe !== false,
@@ -285,10 +312,9 @@ export async function onRequestPost({ request }) {
         }
 
         if (name === 'meow_memory_query_bundle') {
-          // ★ persona_id + cross_persona 透传(后端 recall-bundle.js 会校验)
           const data = await callApi(origin, '/api/recall-bundle', {
             query: args.query,
-            persona_id: args.persona_id || '',
+            persona_id: effectivePersona,
             cross_persona: args.cross_persona === true,
             persona_name: args.persona_name || '',
             topK: args.topK || 20,
