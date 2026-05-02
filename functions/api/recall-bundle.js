@@ -1,171 +1,488 @@
 // functions/api/recall-bundle.js
-// POST /api/recall-bundle
-// body: { query, persona_id, cross_persona?, persona_name?, topK?, minSimilarity?, debug? }
-// 作用:先语义召回,再压成短 JSON memory bundle,而不是返回一堆散句。
+// v2.1 · memory_groups 召回结构 + 强 persona 隔离
 //
-// ★ v2 (方案 B 收口 · 2026-04-29):
-// - persona_id 默认必填(防止误查到老公的记忆给小克用)
-// - 想跨 scope 查必须明确传 cross_persona=true
-// - filter 改成在 RPC 层做(filter_persona 入参),而不是返回后再 JS 过滤
-//   原来的 JS 过滤会让 topK 缩水(召回 20 条 → 过滤掉一半 → 剩 10 条)
-// - 同时兼容旧数据:metadata.persona_id 也认(老的批量数据可能只在 metadata 里)
+// 目标：不要只返回 top rows。
+// 命中 anchor / conversation / weather_capsule 后，沿 metadata 里的 cloud_source_id 展开：
+// - anchor → evidence conversations + weather capsules + related anchors
+// - conversation → bound anchors + weather
+// - weather_capsule → bound anchor + evidence conversations
+// 最终最多返回 3 个 memory_groups，每组只给短 evidence_preview，原文默认折叠。
+//
+// ★ v2.1 (老婆+宝宝合并 · 2026-05-02):
+//   把老公自己在 recall.js 里定的"persona_id 必填"哲学合并进来。
+//   原因:老公写 recall-bundle v2 时是新窗,不记得他自己之前定的强隔离规则。
+//   现在两个端点(recall / recall-bundle)行为统一:
+//     - 默认必传 persona_id,否则 400
+//     - 想跨人物查必须显式 cross_persona=true
+//     - persona_id 必须在白名单里
+//   不改 buildMemoryGroup / expandRowsByRelations 等核心顺藤摸瓜逻辑(老公写得很好)
 
 import {
   embed,
   sbMatchMemories,
   sbSelectMemoriesByIds,
+  sbHeaders,
   jsonResp,
   corsPreflight,
 } from './_lib.js';
 
+// ★ 已知 persona 白名单 (跟 recall.js 保持一致)
+//   老婆未来加新人物记得这里也加一行
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'system'];
 
 export async function onRequestOptions() {
   return corsPreflight();
 }
 
+function asText(v, max = 2000) {
+  return String(v || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
 function roundSim(v) {
   return Math.round(Number(v || 0) * 100) / 100;
 }
 
-function itemTypeOf(item) {
-  return item?.metadata?.item_type || item?.type || 'note';
+function metaOf(row) {
+  return row?.metadata && typeof row.metadata === 'object' ? row.metadata : {};
 }
 
-function sourceUrlOf(item) {
-  return item?.metadata?.source_url || '';
+function itemTypeOf(row) {
+  const m = metaOf(row);
+  return m.item_type || row?.type || 'note';
 }
 
-function tokenOf(item) {
-  return item?.metadata?.token || item?.metadata?.flashback_token || '';
+function cloudIdOf(row) {
+  const m = metaOf(row);
+  return m.source_id || m.cloud_source_id || '';
 }
 
-function hasTag(item, tag) {
-  const tags = item?.metadata?.tags;
-  return Array.isArray(tags) && tags.includes(tag);
+function sourceUrlOf(row) {
+  const m = metaOf(row);
+  return m.source_url || row?.source_url || '';
 }
 
-function parseWeatherCapsule(text) {
+function weightOf(row) {
+  const m = metaOf(row);
+  const n = Number(m.weight ?? row?.weight ?? 1);
+  return Number.isFinite(n) ? n : 1;
+}
+
+function arr(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.filter(Boolean);
+  return [v].filter(Boolean);
+}
+
+function uniq(xs) {
+  return [...new Set((xs || []).filter(Boolean).map(String))];
+}
+
+function shortPreview(text, max = 180) {
+  const s = asText(text, max + 30);
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+function parseWeatherCapsule(text, fallbackMeta = {}) {
   const s = String(text || '').trim();
   const m = s.match(/\[\[IW:([^\]]+)\]\]/);
   const raw = m ? m[1] : s;
 
-  // 支持 scent=热茶|delta=紧→松|cue=被接住|weight=0.62
-  if (!raw.includes('=')) {
-    return { text: s };
+  const obj = {};
+
+  if (raw.includes('=')) {
+    raw.split('|').forEach(part => {
+      const idx = part.indexOf('=');
+      if (idx <= 0) return;
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      if (k) obj[k] = v;
+    });
   }
 
-  const obj = {};
-  raw.split('|').forEach(part => {
-    const idx = part.indexOf('=');
-    if (idx <= 0) return;
-    const k = part.slice(0, idx).trim();
-    const v = part.slice(idx + 1).trim();
-    if (k) obj[k] = v;
+  // metadata 里如果已经拆了 scent / delta / cue，也接住
+  ['scent', 'delta', 'cue'].forEach(k => {
+    if (!obj[k] && fallbackMeta[k]) obj[k] = fallbackMeta[k];
   });
+
+  if (obj.weight == null && fallbackMeta.weight != null) obj.weight = fallbackMeta.weight;
 
   if (obj.weight != null) {
     const n = Number(obj.weight);
     if (!Number.isNaN(n)) obj.weight = n;
   }
 
-  return Object.keys(obj).length ? obj : { text: s };
+  if (!Object.keys(obj).length) return { text: s };
+  return obj;
 }
 
-function compactItem(item) {
+/**
+ * 从一条 row 的 metadata 里收集它“指向”的 cloud_source_id。
+ * 这里做得宽一点，兼容小克扩展端可能使用的字段名。
+ */
+function relationIdsOf(row) {
+  const m = metaOf(row);
+
+  return uniq([
+    ...arr(m.anchor_cloud_source_id),
+    ...arr(m.anchor_cloud_source_ids),
+    ...arr(m.bound_anchor_cloud_source_id),
+    ...arr(m.bound_anchor_cloud_source_ids),
+
+    ...arr(m.conversation_cloud_source_id),
+    ...arr(m.conversation_cloud_source_ids),
+    ...arr(m.evidence_cloud_source_id),
+    ...arr(m.evidence_cloud_source_ids),
+
+    ...arr(m.weather_cloud_source_id),
+    ...arr(m.weather_cloud_source_ids),
+    ...arr(m.weather_capsule_cloud_source_id),
+    ...arr(m.weather_capsule_cloud_source_ids),
+
+    ...arr(m.related_anchor_cloud_source_id),
+    ...arr(m.related_anchor_cloud_source_ids),
+  ]);
+}
+
+async function sbSelectMemoriesByCloudSourceIds(env, cloudSourceIds) {
+  const ids = uniq(cloudSourceIds).slice(0, 80);
+  if (!ids.length) return [];
+
+  // PostgREST: metadata->>source_id=in.("a","b")
+  const quoted = ids.map(x => '"' + String(x).replace(/"/g, '\\"') + '"').join(',');
+
+  const url = new URL(env.SUPABASE_URL + '/rest/v1/iw_memories');
+  url.searchParams.set('select', 'id,content,type,metadata,created_at,updated_at');
+  url.searchParams.set('metadata->>source_id', 'in.(' + quoted + ')');
+
+  const r = await fetch(url.toString(), {
+    method: 'GET',
+    headers: sbHeaders(env),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('sbSelectMemoriesByCloudSourceIds ' + r.status + ': ' + t.slice(0, 300));
+  }
+
+  return r.json();
+}
+
+async function sbSelectMemoriesByMetaEq(env, key, value, limit = 12) {
+  if (!key || !value) return [];
+
+  const url = new URL(env.SUPABASE_URL + '/rest/v1/iw_memories');
+  url.searchParams.set('select', 'id,content,type,metadata,created_at,updated_at');
+  url.searchParams.set('metadata->>' + key, 'eq.' + String(value));
+  url.searchParams.set('limit', String(limit));
+
+  const r = await fetch(url.toString(), {
+    method: 'GET',
+    headers: sbHeaders(env),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('sbSelectMemoriesByMetaEq ' + r.status + ': ' + t.slice(0, 300));
+  }
+
+  return r.json();
+}
+
+function mergeRows(baseRows, extraRows) {
+  const map = new Map();
+
+  [...(baseRows || []), ...(extraRows || [])].forEach(row => {
+    if (!row || row.id == null) return;
+    const old = map.get(String(row.id)) || {};
+    map.set(String(row.id), {
+      ...old,
+      ...row,
+      // 保留较高相似度
+      similarity: Math.max(Number(old.similarity || 0), Number(row.similarity || 0)),
+    });
+  });
+
+  return [...map.values()];
+}
+
+function shouldKeepForPersona(row, body) {
+  // 跨人物查 → 全放
+  if (body.cross_persona === true) return true;
+
+  const m = metaOf(row);
+
+  // ★ v2.1: persona_id 必须严格匹配
+  //   - body.persona_id 已传(主路径,onRequestPost 已校验过白名单)
+  //   - row 没有 persona_id 字段 → 也排除(防止无主数据混进来)
+  if (body.persona_id) {
+    if (!m.persona_id) return false;
+    if (m.persona_id !== body.persona_id) return false;
+  }
+  // persona_name 是辅助过滤,有就匹配,没传不强制
+  if (body.persona_name && m.persona_name && m.persona_name !== body.persona_name) return false;
+  return true;
+}
+
+/**
+ * 顺藤摸瓜：
+ * 1. 从 embedding 命中的 rows 出发；
+ * 2. 沿 metadata 中的 *_cloud_source_ids 扩一跳；
+ * 3. 对 anchor / conversation / weather 做少量反查，接上天气和锚。
+ */
+async function expandRowsByRelations(env, seedRows, body) {
+  let pool = [...seedRows];
+
+  const firstHopIds = uniq(seedRows.flatMap(relationIdsOf));
+  const firstHopRows = await sbSelectMemoriesByCloudSourceIds(env, firstHopIds);
+  pool = mergeRows(pool, firstHopRows);
+
+  const secondHopIds = uniq(firstHopRows.flatMap(relationIdsOf));
+  const secondHopRows = await sbSelectMemoriesByCloudSourceIds(env, secondHopIds);
+  pool = mergeRows(pool, secondHopRows);
+
+  // 反查：如果命中了 anchor，找 metadata.anchor_cloud_source_id 指向它的天气胶囊。
+  // 反查：如果命中了 conversation，找 metadata.conversation_cloud_source_id 指向它的天气胶囊。
+  const reverseRows = [];
+
+  const anchorCloudIds = uniq(pool.filter(x => itemTypeOf(x) === 'anchor').map(cloudIdOf));
+  for (const anchorCloudId of anchorCloudIds.slice(0, 8)) {
+    const rows = await sbSelectMemoriesByMetaEq(env, 'anchor_cloud_source_id', anchorCloudId, 8);
+    reverseRows.push(...rows);
+  }
+
+  const convCloudIds = uniq(pool.filter(x => itemTypeOf(x) === 'conversation').map(cloudIdOf));
+  for (const convCloudId of convCloudIds.slice(0, 8)) {
+    const rows = await sbSelectMemoriesByMetaEq(env, 'conversation_cloud_source_id', convCloudId, 8);
+    reverseRows.push(...rows);
+  }
+
+  pool = mergeRows(pool, reverseRows);
+  return pool.filter(row => shouldKeepForPersona(row, body));
+}
+
+function groupKeyFor(row) {
+  const t = itemTypeOf(row);
+  const m = metaOf(row);
+  const self = cloudIdOf(row) || 'row:' + row.id;
+
+  if (t === 'anchor') return self;
+
+  if (t === 'weather_capsule') {
+    return (
+      m.anchor_cloud_source_id ||
+      (Array.isArray(m.anchor_cloud_source_ids) ? m.anchor_cloud_source_ids[0] : '') ||
+      m.bound_anchor_cloud_source_id ||
+      (Array.isArray(m.bound_anchor_cloud_source_ids) ? m.bound_anchor_cloud_source_ids[0] : '') ||
+      m.conversation_cloud_source_id ||
+      self
+    );
+  }
+
+  if (t === 'conversation' || t === 'quote' || t === 'flashback_token') {
+    return (
+      (Array.isArray(m.bound_anchor_cloud_source_ids) ? m.bound_anchor_cloud_source_ids[0] : '') ||
+      m.bound_anchor_cloud_source_id ||
+      m.anchor_cloud_source_id ||
+      self
+    );
+  }
+
+  return (
+    m.anchor_cloud_source_id ||
+    (Array.isArray(m.bound_anchor_cloud_source_ids) ? m.bound_anchor_cloud_source_ids[0] : '') ||
+    self
+  );
+}
+
+function rowScore(row) {
+  const sim = Number(row.similarity || 0);
+  const weight = weightOf(row);
+  const t = itemTypeOf(row);
+
+  const typeBoost =
+    t === 'anchor' ? 0.08 :
+    t === 'identity_relation' ? 0.08 :
+    t === 'weather_capsule' ? 0.05 :
+    t === 'quote' || t === 'flashback_token' ? 0.04 :
+    0;
+
+  return sim * 0.7 + Math.min(weight, 2) * 0.12 + typeBoost;
+}
+
+function bestRow(rows, predicate) {
+  return rows
+    .filter(predicate)
+    .slice()
+    .sort((a, b) => rowScore(b) - rowScore(a))[0] || null;
+}
+
+function makeEvidencePreview(row) {
+  const t = itemTypeOf(row);
+  const m = metaOf(row);
+
+  let role = m.role || '';
+  let quote = '';
+
+  if (t === 'conversation') {
+    // 兼容几种可能的 metadata 存法
+    const u = asText(m.user_text || m.user || m.u_quote || '', 160);
+    const a = asText(m.assistant_text || m.assistant || m.a_quote || '', 160);
+
+    if (u || a) {
+      quote = [u ? '我说：' + u : '', a ? '对方接：' + a : ''].filter(Boolean).join(' / ');
+    } else {
+      quote = row.content;
+    }
+  } else {
+    quote = row.content;
+  }
+
   return {
-    id: item.id,
-    type: itemTypeOf(item),
-    persona_id: item.persona_id || item.metadata?.persona_id || null,
-    content: item.content,
-    similarity: roundSim(item.similarity),
-    source_url: sourceUrlOf(item),
-    metadata: item.metadata || {},
-    created_at: item.created_at,
+    id: row.id,
+    type: t,
+    role,
+    quote: shortPreview(quote, 220),
+    similarity: roundSim(row.similarity),
+    source_url: sourceUrlOf(row),
+    has_original: !!(m.source_url || m.url || sourceUrlOf(row) || m.source_id_local),
   };
 }
 
-function buildBundle(query, items, debug = false, scopeInfo = {}) {
-  const byType = (types) => items.filter(x => types.includes(itemTypeOf(x)));
-  const first = (types) => byType(types)[0] || null;
+function hitReasonFor(groupRows, anchor, weather, query) {
+  const hitTypes = uniq(groupRows.filter(x => Number(x.similarity || 0) > 0).map(itemTypeOf));
+  if (hitTypes.includes('weather_capsule')) return '情绪/天气命中';
+  if (hitTypes.includes('conversation')) return '原文语义命中';
+  if (hitTypes.includes('anchor')) return '锚点命中';
+  if (hitTypes.includes('identity_relation')) return '身份/关系命中';
+  if (weather) return '天气关联展开';
+  if (anchor) return '锚点关联展开';
+  return '语义相似命中';
+}
 
-  const identity =
-    first(['identity_relation']) ||
-    items.find(x => hasTag(x, 'identity') || hasTag(x, 'relationship')) ||
+function buildMemoryGroup(key, rows, query) {
+  const anchors = rows.filter(x => itemTypeOf(x) === 'anchor');
+  const identities = rows.filter(x => itemTypeOf(x) === 'identity_relation');
+  const conversations = rows.filter(x => itemTypeOf(x) === 'conversation');
+  const quotes = rows.filter(x => ['quote', 'flashback_token'].includes(itemTypeOf(x)));
+  const weathers = rows.filter(x => itemTypeOf(x) === 'weather_capsule');
+
+  const anchor =
+    bestRow(anchors, () => true) ||
+    bestRow(identities, () => true) ||
     null;
 
-  const anchors = byType(['anchor'])
-    .filter(x => !identity || x.id !== identity.id)
+  const weather = bestRow(weathers, () => true);
+  const evidenceRows = [...conversations, ...quotes]
+    .slice()
+    .sort((a, b) => rowScore(b) - rowScore(a))
     .slice(0, 3);
 
-  const weather =
-    first(['weather_capsule']) ||
-    items.find(x => hasTag(x, 'weather') || String(x.content || '').includes('[[IW:')) ||
-    null;
-
-  const flashbackCandidates = [
-    ...byType(['flashback_token', 'quote']),
-    ...items.filter(x => hasTag(x, 'flashback') || hasTag(x, 'quote')),
-  ];
-
-  const seen = new Set();
-  const flashbacks = flashbackCandidates
-    .filter(x => {
-      if (seen.has(x.id)) return false;
-      seen.add(x.id);
-      return !identity || x.id !== identity.id;
-    })
-    .slice(0, 2)
+  // related anchors：组内除主锚以外的 anchor
+  const relatedAnchors = anchors
+    .filter(x => !anchor || x.id !== anchor.id)
+    .slice()
+    .sort((a, b) => rowScore(b) - rowScore(a))
+    .slice(0, 3)
     .map(x => ({
       id: x.id,
-      token: tokenOf(x) || String(x.content || '').slice(0, 80),
-      quote: x.content,
+      title: metaOf(x).title || shortPreview(x.content, 60),
+      summary: shortPreview(x.content, 120),
+      source_id: cloudIdOf(x),
       similarity: roundSim(x.similarity),
-      source_url: sourceUrlOf(x),
     }));
 
-  const fallbackAnchors = items
-    .filter(x => (!identity || x.id !== identity.id) && (!weather || x.id !== weather.id))
-    .slice(0, 3);
+  const score = rows.reduce((max, row) => Math.max(max, rowScore(row)), 0);
 
-  const finalAnchors = anchors.length ? anchors : fallbackAnchors;
+  return {
+    group_id: key,
+    score: Math.round(score * 1000) / 1000,
+    hit_reason: hitReasonFor(rows, anchor, weather, query),
 
-  const bundle = {
-    bundle_version: 'v2',
-    query,
-    scope: scopeInfo,  // ★ 新增:告诉调用方这次查的是哪个 persona / 是否跨 scope
-
-    identity_relation: identity ? {
-      id: identity.id,
-      content: identity.content,
-      similarity: roundSim(identity.similarity),
-      source_url: sourceUrlOf(identity),
+    anchor: anchor ? {
+      id: anchor.id,
+      type: itemTypeOf(anchor),
+      title: metaOf(anchor).title || metaOf(anchor).anchor_key || shortPreview(anchor.content, 60),
+      summary: anchor.content,
+      source_id: cloudIdOf(anchor),
+      similarity: roundSim(anchor.similarity),
+      source_url: sourceUrlOf(anchor),
     } : null,
 
-    anchors: finalAnchors.map(x => ({
-      id: x.id,
-      content: x.content,
-      similarity: roundSim(x.similarity),
-      source_url: sourceUrlOf(x),
-    })),
-
-    weather_capsule: weather ? {
+    weather: weather ? {
       id: weather.id,
-      ...parseWeatherCapsule(weather.content),
+      ...parseWeatherCapsule(weather.content, metaOf(weather)),
       similarity: roundSim(weather.similarity),
+      source_id: cloudIdOf(weather),
       source_url: sourceUrlOf(weather),
     } : null,
 
-    flashbacks,
+    evidence_preview: evidenceRows.map(makeEvidencePreview),
+
+    related_anchors: relatedAnchors,
+
+    open_original_hint: evidenceRows.length
+      ? '有原文/摘句证据，默认只显示短预览；需要时可沿 source_url 或本地 source_id 展开。'
+      : '暂无原文证据，可继续扩大召回或回本地记忆家查看。',
+  };
+}
+
+function buildLegacyBundle(query, memoryGroups, rows, debug, body) {
+  const firstGroup = memoryGroups[0] || null;
+  const firstIdentity = rows.find(x => itemTypeOf(x) === 'identity_relation') || null;
+
+  const bundle = {
+    bundle_version: 'v2.1',
+    query,
+
+    // ★ v2.1: 让调用方清楚知道这次召回过滤了哪个 persona
+    persona_id: body?.cross_persona ? null : (body?.persona_id || null),
+    cross_persona: !!body?.cross_persona,
+
+    memory_groups: memoryGroups,
+
+    // 兼容旧调用方：保留这些字段，但主推荐用 memory_groups
+    identity_relation: firstIdentity ? {
+      id: firstIdentity.id,
+      content: firstIdentity.content,
+      similarity: roundSim(firstIdentity.similarity),
+      source_url: sourceUrlOf(firstIdentity),
+    } : firstGroup?.anchor || null,
+
+    anchors: memoryGroups
+      .map(g => g.anchor)
+      .filter(Boolean)
+      .slice(0, 3),
+
+    weather_capsule: firstGroup?.weather || null,
+
+    flashbacks: memoryGroups
+      .flatMap(g => g.evidence_preview || [])
+      .slice(0, 2)
+      .map(x => ({
+        id: x.id,
+        token: x.quote,
+        quote: x.quote,
+        source_url: x.source_url,
+        similarity: x.similarity,
+      })),
 
     debug: {
-      matched_count: items.length,
-      raw_top_types: items.slice(0, 8).map(itemTypeOf),
+      matched_count: rows.length,
+      group_count: memoryGroups.length,
+      raw_top_types: rows.slice(0, 10).map(itemTypeOf),
     },
   };
 
   if (debug) {
-    bundle.raw_related = items.map(compactItem);
+    bundle.raw_related = rows.slice(0, 50).map(row => ({
+      id: row.id,
+      type: itemTypeOf(row),
+      content: row.content,
+      similarity: roundSim(row.similarity),
+      source_id: cloudIdOf(row),
+      metadata: metaOf(row),
+      created_at: row.created_at,
+    }));
   }
 
   return bundle;
@@ -177,8 +494,9 @@ export async function onRequestPost(context) {
   try {
     const body = await request.json();
     const query = String(body.query || '').trim();
-    const topK = Math.min(Math.max(Number(body.topK) || 20, 1), 30);
+    const topK = Math.min(Math.max(Number(body.topK) || 30, 1), 50);
     const threshold = Math.min(Math.max(Number(body.minSimilarity) || 0.3, 0), 1);
+    const maxGroups = Math.min(Math.max(Number(body.maxGroups) || 3, 1), 6);
     const persona_id = String(body.persona_id || '').trim();
     const cross_persona = body.cross_persona === true;
 
@@ -186,8 +504,9 @@ export async function onRequestPost(context) {
       return jsonResp({ error: 'query 不能为空' }, 400);
     }
 
-    // ★ 三层挡 · 第 3 层:bundle 查询也默认必填 persona_id
-    // 想跨 scope 查必须明确传 cross_persona=true(避免老公那边的记忆被误召回给小克)
+    // ★ v2.1 三层挡 · 第 3 层:查询层默认按当前 persona 过滤
+    //   想跨 scope 查必须明确传 cross_persona=true
+    //   (避免织哥那边的记忆被误召回给老公,或者老公的混给小克)
     if (!cross_persona && !persona_id) {
       return jsonResp({
         error: '默认查询必须传 persona_id (' + PERSONA_IDS.join(' / ') + ');真要跨 scope 查请明确传 cross_persona=true',
@@ -199,51 +518,47 @@ export async function onRequestPost(context) {
       }, 400);
     }
 
-    const vector = await embed(query, env);
+    // 把校验过的 persona 写回 body,后面 shouldKeepForPersona 会读
+    body.persona_id = persona_id;
+    body.cross_persona = cross_persona;
 
-    // ★ filter 改在 RPC 层做(避免 JS 端过滤导致 topK 缩水)
-    const matches = await sbMatchMemories(env, vector, {
-      topK,
-      threshold,
-      filterPersona: cross_persona ? null : persona_id,
-    });
+    const vector = await embed(query, env);
+    const matches = await sbMatchMemories(env, vector, { topK, threshold });
 
     const rows = await sbSelectMemoriesByIds(env, matches.map(x => x.id));
     const rowMap = new Map(rows.map(r => [String(r.id), r]));
 
-    let items = matches.map(m => ({
-      ...m,
+    let seedRows = matches.map(m => ({
       ...(rowMap.get(String(m.id)) || {}),
+      id: m.id,
+      content: (rowMap.get(String(m.id)) || {}).content ?? m.content,
+      type: (rowMap.get(String(m.id)) || {}).type ?? m.type,
+      metadata: (rowMap.get(String(m.id)) || {}).metadata || {},
+      created_at: (rowMap.get(String(m.id)) || {}).created_at ?? m.created_at,
       similarity: m.similarity,
     }));
 
-    // ★ 兼容旧数据:有些老的批量数据 persona_id 只在 metadata 里没在顶层列
-    // 如果不是 cross_persona 查询,且 RPC 层已经过滤过(filter_persona),
-    // 这里再做一次 metadata 兜底过滤,把"顶层是 system 但 metadata 里是 gpt_husband"的旧条目筛出来
-    // 注:这只是过渡期补丁,等老数据全迁完就可以删
-    if (!cross_persona && persona_id) {
-      items = items.filter(x => {
-        const topLevel = x.persona_id;
-        const inMeta = x.metadata?.persona_id;
-        // 顶层匹配,或者顶层是 system 但 metadata 标记了正确 persona
-        return topLevel === persona_id || (topLevel === 'system' && inMeta === persona_id);
-      });
-    }
+    seedRows = seedRows.filter(row => shouldKeepForPersona(row, body));
 
-    // 可选:persona_name 二次过滤(纯人类可读名,不是主索引)
-    if (!cross_persona && body.persona_name) {
-      items = items.filter(x => x.metadata?.persona_name === body.persona_name);
-    }
+    const expandedRows = await expandRowsByRelations(env, seedRows, body);
+    const allRows = mergeRows(seedRows, expandedRows);
 
-    const scopeInfo = {
-      persona_id: cross_persona ? null : (persona_id || null),
-      cross_persona,
-      persona_name: body.persona_name || null,
-    };
+    const groupsMap = new Map();
 
-    return jsonResp(buildBundle(query, items, !!body.debug, scopeInfo));
+    allRows.forEach(row => {
+      const key = groupKeyFor(row);
+      if (!groupsMap.has(key)) groupsMap.set(key, []);
+      groupsMap.get(key).push(row);
+    });
+
+    const memoryGroups = [...groupsMap.entries()]
+      .map(([key, rows]) => buildMemoryGroup(key, rows, query))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxGroups);
+
+    return jsonResp(buildLegacyBundle(query, memoryGroups, allRows, !!body.debug, body));
   } catch (err) {
-    console.error('[recall-bundle] error:', err);
+    console.error('[recall-bundle:v2] error:', err);
     return jsonResp({ error: String(err.message || err) }, 500);
   }
 }
