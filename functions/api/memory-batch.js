@@ -126,7 +126,49 @@ export async function onRequestPost(context) {
 
         const itemType = cleanText(item.item_type || item.type || 'note', 80);
         const metadata = buildMetadata(item, body, itemPersonaId);
-        const vector = await embed(content, env);
+
+        // ★ 老婆 patch v2 (2026-05): 内容审核 fallback
+        //   SiliconFlow code 20015 真凶 = 内容审核拦截 (敏感话题如基因/生命/政治等)
+        //   策略: 失败时用"安全版本"重试 — 只用主题+氛围+锚类等标签做 embedding
+        //         敏感原文还在 metadata 里, 召回时拿原文展示
+        //         embedding 质量降级但能存进去, 总比丢一条强
+        let vector;
+        let embedSafeMode = false;
+        try {
+          vector = await embed(content, env);
+        } catch (embedErr) {
+          const msg = String(embedErr?.message || embedErr || '');
+          // 内容审核典型错误: code 20015 / parameter is invalid / sensitive / inappropriate
+          const isContentBlock = /20015|parameter is invalid|sensitive|inappropriate|审核|敏感/i.test(msg);
+          if (isContentBlock) {
+            // 拼安全版本: 只用非敏感标签
+            const safeBits = [];
+            if (metadata.topic) safeBits.push(metadata.topic);
+            if (metadata.mood) safeBits.push(metadata.mood);
+            if (metadata.anchor_class) safeBits.push(metadata.anchor_class);
+            if (metadata.core_topic_name) safeBits.push(metadata.core_topic_name);
+            safeBits.push(itemType);
+            const safeContent = '[' + safeBits.filter(Boolean).join(' · ') + ']' +
+                                (metadata.persona_name ? ' (' + metadata.persona_name + ')' : '');
+            console.warn('[embed safe fallback]', {
+              source_id: metadata.source_id,
+              original_len: content.length,
+              safe_content: safeContent,
+              original_error: msg.slice(0, 200),
+            });
+            try {
+              vector = await embed(safeContent, env);
+              embedSafeMode = true;
+              metadata._embed_safe_mode = true;       // 标记: 这条 embedding 用了安全模式
+              metadata._embed_blocked_reason = msg.slice(0, 200);
+            } catch (safeErr) {
+              // 安全版本也失败 — 真的没救了
+              throw new Error('内容审核拦截且安全 fallback 也失败: ' + String(safeErr?.message || safeErr).slice(0, 200));
+            }
+          } else {
+            throw embedErr;
+          }
+        }
 
         let row = null;
         let action = 'inserted';
@@ -163,6 +205,7 @@ export async function onRequestPost(context) {
           persona_id: itemPersonaId,
           source: metadata.source,
           source_id: metadata.source_id,
+          embed_safe_mode: embedSafeMode,  // ★ 老婆 patch v2: 标记降级模式, 扩展端能在 UI 提示
         });
       } catch (e) {
         failed.push({
