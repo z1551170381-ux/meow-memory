@@ -10,32 +10,96 @@
  * @param {object} env - Cloudflare 环境变量
  * @returns {Promise<number[]>} 1024 维向量
  */
+ * ★ 老婆 patch v1 (2026-05): 加诊断日志 + 输入清洗 + 重试
+ *   原因: SiliconFlow 偶发 code 20015 "parameter invalid",
+ *         一直查不到真凶 — 加日志把 input 全貌打出来,下次失败一眼定位
+ */
 export async function embed(text, env) {
-  const input = String(text || '').trim().slice(0, 3000);
-  if (!input) throw new Error('embed: empty input');
+  // ★ 输入清洗: 去掉控制字符 / BOM / 零宽字符 — 这些可能让 SiliconFlow 返 20015
+  //   保留: 换行 \n \r \t、可见 unicode
+  //   移除: 其他 ASCII 控制字符 (0x00-0x1F 除 \n\r\t)、BOM (\uFEFF)、零宽空格 (\u200B-\u200D)
+  let rawInput = String(text || '');
+  const beforeClean = rawInput.length;
+  rawInput = rawInput
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')  // 控制字符
+    .replace(/[\uFEFF\u200B-\u200D]/g, '')              // BOM + 零宽
+    .trim();
+  const afterClean = rawInput.length;
+  const input = rawInput.slice(0, 3000);
 
-  const r = await fetch('https://api.siliconflow.cn/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + env.SILICONFLOW_API_KEY,
-    },
-    body: JSON.stringify({
-      model: 'Qwen/Qwen3-Embedding-0.6B',
-      input: input,
-    }),
-  });
-
-  if (!r.ok) {
-    const errText = await r.text();
-    throw new Error('embedding API ' + r.status + ': ' + errText.slice(0, 300));
+  if (!input) {
+    console.error('[embed] empty input after cleaning', { beforeClean, afterClean });
+    throw new Error('embed: empty input');
   }
 
-  const data = await r.json();
-  if (!data.data || !data.data[0]?.embedding) {
-    throw new Error('embedding API 返回格式异常: ' + JSON.stringify(data).slice(0, 300));
+  // ★ retry 一次 — 网络抖动 / API 瞬时 5xx 用
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const r = await fetch('https://api.siliconflow.cn/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + env.SILICONFLOW_API_KEY,
+        },
+        body: JSON.stringify({
+          model: 'Qwen/Qwen3-Embedding-0.6B',
+          input: input,
+        }),
+      });
+
+      if (!r.ok) {
+        const errText = await r.text();
+        // ★ 诊断日志: 把 input 的全貌打出来 — 长度 / 头部 / 尾部 / 字符类型分布
+        const headFrag = input.slice(0, 80);
+        const tailFrag = input.slice(-80);
+        const charStats = {
+          total: input.length,
+          chinese: (input.match(/[\u4e00-\u9fa5]/g) || []).length,
+          ascii: (input.match(/[\x20-\x7E]/g) || []).length,
+          newlines: (input.match(/\n/g) || []).length,
+          spaces: (input.match(/\s/g) || []).length,
+          nonBmp: (input.match(/[\uD800-\uDFFF]/g) || []).length,  // surrogate pair, 表情符号
+          questionMarks: (input.match(/[?？]/g) || []).length,
+        };
+        console.error('[embed] SiliconFlow ' + r.status + ' (attempt ' + attempt + ')', {
+          model: 'Qwen/Qwen3-Embedding-0.6B',
+          errText: errText.slice(0, 400),
+          inputLen: input.length,
+          beforeClean,
+          afterClean,
+          head: headFrag,
+          tail: tailFrag,
+          charStats,
+        });
+        // 5xx / 408 重试,其他直接抛
+        if (attempt === 1 && (r.status >= 500 || r.status === 408 || r.status === 429)) {
+          lastErr = new Error('embedding API ' + r.status + ': ' + errText.slice(0, 300));
+          await new Promise(res => setTimeout(res, 500));
+          continue;
+        }
+        throw new Error('embedding API ' + r.status + ': ' + errText.slice(0, 300));
+      }
+
+      const data = await r.json();
+      if (!data.data || !data.data[0]?.embedding) {
+        console.error('[embed] bad response shape', { data: JSON.stringify(data).slice(0, 300) });
+        throw new Error('embedding API 返回格式异常: ' + JSON.stringify(data).slice(0, 300));
+      }
+      // 维度自检 — 万一未来 SiliconFlow 改默认维度, 立刻报警 (避免悄悄写错维度向量进库)
+      const dim = data.data[0].embedding.length;
+      if (dim !== 1024) {
+        console.error('[embed] DIMENSION MISMATCH! expected 1024, got ' + dim,
+                      { model: 'Qwen/Qwen3-Embedding-0.6B' });
+        throw new Error('embedding 维度 ' + dim + ' 不是预期的 1024 — SiliconFlow 可能改默认了, 需要在 body 加 dimensions: 1024 或升 SQL VECTOR 列');
+      }
+      return data.data[0].embedding;
+    } catch (e) {
+      if (attempt === 2) throw e;
+      lastErr = e;
+    }
   }
-  return data.data[0].embedding;
+  throw lastErr || new Error('embed: unknown error');
 }
 
 /**
