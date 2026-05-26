@@ -237,12 +237,20 @@ function shouldKeepForPersona(row, body) {
 
   const m = metaOf(row);
 
+  // ★ 老婆 patch (2026-05-26): 兼容顶层 row.persona_id 作为 fallback
+  //   真凶: anchor / core_anchor 的 metadata 里很多没有 persona_id 字段
+  //         但顶层 row.persona_id 是有的 (recall_memory 直接调能看到)
+  //         旧版 shouldKeepForPersona 只看 m.persona_id → anchor 全被过滤
+  //         → bundle.anchors 永远空 (跟 reserved slots 完全无关的老 bug)
+  //   修法: m.persona_id 优先, 没有就 fallback 到 row.persona_id 顶层字段
+  const rowPersona = m.persona_id || row.persona_id || null;
+
   // ★ v2.1: persona_id 必须严格匹配
   //   - body.persona_id 已传(主路径,onRequestPost 已校验过白名单)
   //   - row 没有 persona_id 字段 → 也排除(防止无主数据混进来)
   if (body.persona_id) {
-    if (!m.persona_id) return false;
-    if (m.persona_id !== body.persona_id) return false;
+    if (!rowPersona) return false;
+    if (rowPersona !== body.persona_id) return false;
   }
   // persona_name 是辅助过滤,有就匹配,没传不强制
   if (body.persona_name && m.persona_name && m.persona_name !== body.persona_name) return false;
