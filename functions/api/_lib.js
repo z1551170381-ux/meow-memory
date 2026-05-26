@@ -281,7 +281,12 @@ export async function sbSelectMemoriesByIds(env, ids) {
   if (!cleanIds.length) return [];
 
   const url = new URL(env.SUPABASE_URL + '/rest/v1/iw_memories');
-  url.searchParams.set('select', 'id,content,type,metadata,created_at,updated_at');
+  // ★ 老婆 patch (2026-05-26): SELECT 必须带 persona_id 顶层字段
+  //   真凶: anchor 的 metadata 里没有 persona_id, 只有顶层 persona_id 字段
+  //         之前 SELECT 不带顶层 persona_id → row 取回来既没顶层也没 metadata.persona_id
+  //         → shouldKeepForPersona 无论怎么改都救不了 (因为根本没数据可看)
+  //   修法: 把 persona_id 加进 SELECT 列表
+  url.searchParams.set('select', 'id,content,type,metadata,persona_id,created_at,updated_at');
   url.searchParams.set('id', 'in.(' + cleanIds.join(',') + ')');
 
   const r = await fetch(url.toString(), {
