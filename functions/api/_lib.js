@@ -135,6 +135,53 @@ export async function sbMatchMemories(env, queryEmbedding, opts = {}) {
   return r.json();
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 老婆 patch · anchor reserved slots
+//   按 type 白名单做语义召回 — 给 anchor / mood_period / old_path 这种
+//   数量少但重要的记忆留专属通道, 不跟 conversation 拼数量
+//
+// 用法:
+//   await sbMatchMemoriesByTypes(env, vector, {
+//     types: ['anchor', 'core_anchor', 'identity_relation'],
+//     topK: 3,
+//     threshold: 0.35,        // anchor 浓缩信息, embedding 自然低, 给宽阈值
+//     filterPersona: 'weave_brother',
+//   });
+//
+// ★ 依赖: Supabase 上需要先创建 iw_match_memories_by_types RPC 函数
+//        (见 01_add_anchor_match_sql.sql)
+// ═══════════════════════════════════════════════════════════════════
+export async function sbMatchMemoriesByTypes(env, queryEmbedding, opts = {}) {
+  const types = Array.isArray(opts.types) ? opts.types.filter(Boolean) : [];
+  if (!types.length) {
+    console.warn('[sbMatchMemoriesByTypes] types 为空, 跳过');
+    return [];
+  }
+  const body = {
+    query_embedding: queryEmbedding,
+    filter_types: types,
+    match_threshold: opts.threshold ?? 0.35,
+    match_count: opts.topK ?? 5,
+    exclude_id: opts.excludeId ?? null,
+    filter_persona: opts.filterPersona ?? null,
+  };
+  const r = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/iw_match_memories_by_types', {
+    method: 'POST',
+    headers: sbHeaders(env),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    // 优雅降级 — 如果 RPC 还没创建(404 或 schema cache miss), 不报错, 返回空
+    if (r.status === 404 || /Could not find the function/i.test(t)) {
+      console.warn('[sbMatchMemoriesByTypes] RPC 未创建, 跳过 (请先跑 01_add_anchor_match_sql.sql)');
+      return [];
+    }
+    throw new Error('sbMatchMemoriesByTypes ' + r.status + ': ' + t.slice(0, 300));
+  }
+  return r.json();
+}
+
  // 插入一条记忆
  // row 必须含: { content, type, persona_id, embedding } + 可选 metadata
 export async function sbInsertMemory(env, row) {

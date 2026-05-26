@@ -27,6 +27,7 @@
 import {
   embed,
   sbMatchMemories,
+  sbMatchMemoriesByTypes,  // ★ 老婆 patch: anchor reserved slots
   sbSelectMemoriesByIds,
   sbHeaders,
   jsonResp,
@@ -704,7 +705,48 @@ export async function onRequestPost(context) {
     body.cross_persona = cross_persona;
 
     const vector = await embed(query, env);
-    const matches = await sbMatchMemories(env, vector, { topK, threshold });
+
+    // ═══════════════════════════════════════════════════════════
+    // ★ 老婆 patch · anchor reserved slots (2026-05-26)
+    //   真凶: anchor 数量远少于 conversation, 混排时被 conv 数量优势挤出 top K
+    //         bundle.anchors 经常空, 主对话 AI 看不到核心锚
+    //   修法: 给 anchor 单独开一通道, 留 3 个保留位 + 宽 threshold (0.35 vs 主 0.5)
+    //         因为 anchor 是浓缩信息, embedding 自然不如原文具体, 需要给"被看见的机会"
+    //   优雅降级: 如果 RPC 还没创建, sbMatchMemoriesByTypes 返回空, 主流程不挂
+    // ═══════════════════════════════════════════════════════════
+
+    const [mainMatches, anchorMatches] = await Promise.all([
+      // 通道 1 · 主查询 (任何 type, topK=30)
+      sbMatchMemories(env, vector, { topK, threshold }),
+      // 通道 2 · anchor 专属 (留 3 个位 + 宽 threshold 0.35)
+      sbMatchMemoriesByTypes(env, vector, {
+        types: ['anchor', 'core_anchor', 'identity_relation'],
+        topK: 3,
+        threshold: 0.35,
+        filterPersona: cross_persona ? null : persona_id,
+      }),
+    ]);
+
+    // 合并去重 — Map 按 id 去重, anchor 先放 (优先级高), 主查询再覆盖
+    //   注意: anchor 通道已经 persona 过滤了, 主查询的 anchor 会有重复, 但 Map 自动去重
+    const matchesMap = new Map();
+    anchorMatches.forEach(m => matchesMap.set(String(m.id), m));
+    mainMatches.forEach(m => {
+      if (!matchesMap.has(String(m.id))) matchesMap.set(String(m.id), m);
+    });
+    const matches = [...matchesMap.values()];
+
+    // 诊断日志 — 让老婆能在 Cloudflare logs 看 anchor 是不是被召回了
+    console.log('[recall-bundle] anchor reserved slots', {
+      query: query.slice(0, 60),
+      persona_id: cross_persona ? '(cross)' : persona_id,
+      main_matches: mainMatches.length,
+      main_anchor_count: mainMatches.filter(m =>
+        ['anchor', 'core_anchor', 'identity_relation'].includes(m.type)
+      ).length,
+      anchor_channel_count: anchorMatches.length,
+      merged_total: matches.length,
+    });
 
     const rows = await sbSelectMemoriesByIds(env, matches.map(x => x.id));
     const rowMap = new Map(rows.map(r => [String(r.id), r]));
