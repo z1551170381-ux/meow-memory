@@ -523,6 +523,32 @@ function buildMemoryGroup(key, rows, query) {
   };
 }
 
+// ★ v143 (老婆 patch): 汇总所有 conv 提到的 anchor (作为"路牌索引")
+//   输入: conversations 数组 (每条带 related_anchors)
+//   输出: 按 anchor_name 分组的数组, 按 conv_count 降序排
+function aggregateAnchorsReferenced(conversations) {
+  const map = new Map();  // anchor_name → { anchor_name, role_label, tier, conv_count, conv_ids }
+  for (const conv of conversations) {
+    const list = Array.isArray(conv.related_anchors) ? conv.related_anchors : [];
+    for (const a of list) {
+      const key = a.anchor_name || '(无名)';
+      if (!map.has(key)) {
+        map.set(key, {
+          anchor_name: a.anchor_name || '',
+          role_label: a.role_label || '',
+          tier: a.tier || '',
+          conv_count: 0,
+          conv_ids: [],
+        });
+      }
+      const entry = map.get(key);
+      entry.conv_count += 1;
+      entry.conv_ids.push(conv.id);
+    }
+  }
+  return [...map.values()].sort((a, b) => b.conv_count - a.conv_count);
+}
+
 // ★ v2.2: 把跨 group 维度的 mood_period / old_path / conversation 汇总成 bundle 顶层字段
 //         主对话 AI 看 bundle 顶层就能拿到全套召回数据,不用挖 memory_groups 数组
 function collectTopLevelFromRows(rows) {
@@ -576,6 +602,34 @@ function collectTopLevelFromRows(rows) {
       const quote = (u || a)
         ? [u ? '我说:' + u : '', a ? '对方接:' + a : ''].filter(Boolean).join(' / ')
         : asText(x.content, 400);
+
+      // ★ v143 (老婆 patch): 提取 conv 关联的 anchor 信息 (作为"路牌标签"附带)
+      //   背景: 老婆识别 ontology 错位 — type=anchor 实际是 AI 实时反思笔记,
+      //         真正的 anchor 由 conv 反复印证后浮现.
+      //         所以 conv 是主体, anchor 作为标签附在 conv 上, 才是正确返回结构.
+      //   数据源: m.linked_anchors / m.sourced_anchors / m.cumulative_anchors
+      //   每条形如 { role, role_label, anchor_id, anchor_name, tier, recall_kind }
+      const anchorSources = [
+        ...(Array.isArray(m.linked_anchors) ? m.linked_anchors : []),
+        ...(Array.isArray(m.sourced_anchors) ? m.sourced_anchors : []),
+        ...(Array.isArray(m.cumulative_anchors) ? m.cumulative_anchors : []),
+      ];
+      // 按 anchor_id 去重 (优先保留 linked > sourced > cumulative 的顺序)
+      const seenIds = new Set();
+      const related_anchors = [];
+      for (const src of anchorSources) {
+        if (!src || !src.anchor_id) continue;
+        if (seenIds.has(src.anchor_id)) continue;
+        seenIds.add(src.anchor_id);
+        related_anchors.push({
+          anchor_name: src.anchor_name || '',
+          role: src.role || '',
+          role_label: src.role_label || '',
+          tier: src.tier || '',
+          recall_kind: src.recall_kind || '',
+        });
+      }
+
       return {
         id: x.id,
         quote: shortPreview(quote, 320),
@@ -583,6 +637,7 @@ function collectTopLevelFromRows(rows) {
         source_id: cloudIdOf(x),
         source_url: sourceUrlOf(x),
         happened_at: m.happened_at || x.created_at || null,
+        related_anchors,  // ★ v143 新增
       };
     });
 
@@ -597,7 +652,7 @@ function buildLegacyBundle(query, memoryGroups, rows, debug, body) {
   const topLevel = collectTopLevelFromRows(rows);
 
   const bundle = {
-    bundle_version: 'v2.2',                                  // ★ v2.2 升版本号 (老婆能看出新版生效)
+    bundle_version: 'v2.3',                                  // ★ v2.3 升版 (v143: conv 加 related_anchors / 顶层加 anchors_referenced + ontology_hint)
     query,
 
     // ★ v2.1: 让调用方清楚知道这次召回过滤了哪个 persona
@@ -649,6 +704,19 @@ function buildLegacyBundle(query, memoryGroups, rows, debug, body) {
     mood_periods:  topLevel.mood_periods,
     old_paths:     topLevel.old_paths,
     conversations: topLevel.conversations,
+
+    // ★ v143 (老婆 patch): 汇总所有 conv 提到的 anchor (作为"路牌索引")
+    //   "锚只是标签" — 老婆原话. conv 是原文证据(主菜), anchor 是路牌索引.
+    anchors_referenced: aggregateAnchorsReferenced(topLevel.conversations),
+
+    // ★ v143 (老婆 patch): ontology 说明 — 告诉调用方 AI 该怎么读这份 bundle
+    //   出处: 2026-05-27 老婆给出的三个定义
+    ontology_hint: {
+      锚点: '一个能把一段记忆重新叫回来的路牌, 告诉你"从这里能回到那种感觉或主题"',
+      沉锚: '一个被反复走过、已经很熟的锚点, 能把人稳定带回某个关系位置或状态',
+      旧路: '几个沉锚之间反复走出来的一条回返路径, 记录"从哪里偏了、怎么回来、最后落到哪里"',
+      读法: 'conversations 是原文证据 (主菜, 有原文滋润); 每条 conv 的 related_anchors 标注它触发了哪个路牌; anchors_referenced 是路牌汇总索引',
+    },
 
     debug: {
       matched_count: rows.length,
