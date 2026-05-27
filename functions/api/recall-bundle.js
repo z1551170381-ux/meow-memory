@@ -23,11 +23,25 @@
 //   设计原则: 单一职责 + 不破坏现有逻辑 + 完全向下兼容。
 //             旧客户端继续读 bundle.anchors / bundle.flashbacks,行为不变。
 //             新客户端可以读三个新字段拿到更全的记忆家数据。
+//
+// ★ v2.4 (新窗小克 patch · 2026-05-27 · BM25 词面通道):
+//   痛点: 向量召回擅长语义, 但工程类具体术语 query 经常跑偏
+//         ("PGRST102 是怎么修的" / "v143 改动" / "reserved slots 真凶")
+//         向量找的是"修 bug 的感觉", 召不准具体术语。
+//   修复: 加第三路并行 sbMatchMemoriesByText (ILIKE 多关键词词面召回),
+//         跟向量 + anchor reserved slots 三路并行融合。
+//         "不把所有功能压在一个人身上才不会塌" — 召回上的 manifesto (锚 #197)。
+//   行为: 优先级 anchor > BM25 > 向量 (后写覆盖前面的, 等同保持优先级)。
+//         BM25 命中给 fallback similarity=0.5 + source='text_match', 让排序能跑。
+//         text_score 跟 cosine similarity 不可比, 不做强排序融合, 只做"留位"。
+//   兼容: 优雅降级 — RPC 没创建时 sbMatchMemoriesByText 返回 [], 主流程不挂。
+//         bundle 顶层加 text_match_count 让测试平台能看 BM25 命中数。
 
 import {
   embed,
   sbMatchMemories,
   sbMatchMemoriesByTypes,  // ★ 老婆 patch: anchor reserved slots
+  sbMatchMemoriesByText,   // ★ v2.4: BM25 词面召回通道
   sbSelectMemoriesByIds,
   sbHeaders,
   jsonResp,
@@ -644,7 +658,7 @@ function collectTopLevelFromRows(rows) {
   return { mood_periods: moods, old_paths: oldPaths, conversations };
 }
 
-function buildLegacyBundle(query, memoryGroups, rows, debug, body) {
+function buildLegacyBundle(query, memoryGroups, rows, debug, body, textMatchCount = 0) {
   const firstGroup = memoryGroups[0] || null;
   const firstIdentity = rows.find(x => itemTypeOf(x) === 'identity_relation') || null;
 
@@ -652,12 +666,15 @@ function buildLegacyBundle(query, memoryGroups, rows, debug, body) {
   const topLevel = collectTopLevelFromRows(rows);
 
   const bundle = {
-    bundle_version: 'v2.3',                                  // ★ v2.3 升版 (v143: conv 加 related_anchors / 顶层加 anchors_referenced + ontology_hint)
+    bundle_version: 'v2.4',                                  // ★ v2.4 升版 (BM25 词面召回通道)
     query,
 
     // ★ v2.1: 让调用方清楚知道这次召回过滤了哪个 persona
     persona_id: body?.cross_persona ? null : (body?.persona_id || null),
     cross_persona: !!body?.cross_persona,
+
+    // ★ v2.4: BM25 词面通道这次返回了几条 (让测试平台 / 调用方能直观看)
+    text_match_count: textMatchCount,
 
     memory_groups: memoryGroups,
 
@@ -789,9 +806,13 @@ export async function onRequestPost(context) {
     //   修法: 给 anchor 单独开一通道, 留 3 个保留位 + 宽 threshold (0.35 vs 主 0.5)
     //         因为 anchor 是浓缩信息, embedding 自然不如原文具体, 需要给"被看见的机会"
     //   优雅降级: 如果 RPC 还没创建, sbMatchMemoriesByTypes 返回空, 主流程不挂
+    //
+    // ★ v2.4 patch · BM25 词面召回 (2026-05-27)
+    //   再加第三路: 词面 ILIKE 匹配, 救工程具体术语 query (PGRST102 / v143 等)
+    //   三路并行, 优先级 anchor > BM25 > 向量 (Map 后写覆盖, 实际等同优先级)
     // ═══════════════════════════════════════════════════════════
 
-    const [mainMatches, anchorMatches] = await Promise.all([
+    const [mainMatches, anchorMatches, textMatches] = await Promise.all([
       // 通道 1 · 主查询 (任何 type, topK=30)
       sbMatchMemories(env, vector, { topK, threshold }),
       // 通道 2 · anchor 专属 (留 3 个位 + 宽 threshold 0.35)
@@ -801,19 +822,31 @@ export async function onRequestPost(context) {
         threshold: 0.35,
         filterPersona: cross_persona ? null : persona_id,
       }),
+      // ★ v2.4 通道 3 · BM25 词面召回 (留 5 个位, 救具体术语 query)
+      sbMatchMemoriesByText(env, query, {
+        topK: 5,
+        filterPersona: cross_persona ? null : persona_id,
+      }),
     ]);
 
-    // 合并去重 — Map 按 id 去重, anchor 先放 (优先级高), 主查询再覆盖
+    // 合并去重 — Map 按 id 去重, 优先级 anchor > BM25 > 向量主路
     //   注意: anchor 通道已经 persona 过滤了, 主查询的 anchor 会有重复, 但 Map 自动去重
+    //   BM25 命中没有 similarity 字段 (它返回的是 text_score), 给 fallback 让下游排序能跑
     const matchesMap = new Map();
     anchorMatches.forEach(m => matchesMap.set(String(m.id), m));
+    textMatches.forEach(m => {
+      if (!matchesMap.has(String(m.id))) {
+        // ★ v2.4: BM25 命中给 fallback similarity, text_score 跟 cosine 不可比, 只是留位
+        matchesMap.set(String(m.id), { ...m, similarity: 0.5, source: 'text_match' });
+      }
+    });
     mainMatches.forEach(m => {
       if (!matchesMap.has(String(m.id))) matchesMap.set(String(m.id), m);
     });
     const matches = [...matchesMap.values()];
 
     // 诊断日志 — 让老婆能在 Cloudflare logs 看 anchor 是不是被召回了
-    console.log('[recall-bundle] anchor reserved slots', {
+    console.log('[recall-bundle] three-channel recall', {
       query: query.slice(0, 60),
       persona_id: cross_persona ? '(cross)' : persona_id,
       main_matches: mainMatches.length,
@@ -821,6 +854,7 @@ export async function onRequestPost(context) {
         ['anchor', 'core_anchor', 'identity_relation'].includes(m.type)
       ).length,
       anchor_channel_count: anchorMatches.length,
+      text_channel_count: textMatches.length,  // ★ v2.4: BM25 命中数
       merged_total: matches.length,
     });
 
@@ -855,7 +889,7 @@ export async function onRequestPost(context) {
       .sort((a, b) => b.score - a.score)
       .slice(0, maxGroups);
 
-    return jsonResp(buildLegacyBundle(query, memoryGroups, allRows, !!body.debug, body));
+    return jsonResp(buildLegacyBundle(query, memoryGroups, allRows, !!body.debug, body, textMatches.length));
   } catch (err) {
     console.error('[recall-bundle:v2.2] error:', err);
     return jsonResp({ error: String(err.message || err) }, 500);
