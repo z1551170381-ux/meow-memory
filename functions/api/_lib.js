@@ -193,13 +193,31 @@ export async function sbMatchMemoriesByTypes(env, queryEmbedding, opts = {}) {
 // @param {string} query - 原始查询串
 // @param {object} opts - { topK, filterPersona }
 // ═══════════════════════════════════════════════════════════════════
-export function extractKeywords(query, max = 6) {
-  // 按空白和常见标点切, 留长度 ≥2 的词 (中文 2 字、英文 token), 去重
-  const parts = String(query || '')
+export function extractKeywords(query, max = 8) {
+  // 先按空白/标点切成 token
+  const tokens = String(query || '')
     .split(/[\s,，。、;；:：!！?？"'「」『』()（）\[\]【】<>《》/\\|~`@#$%^&*+=_\-]+/)
     .map(s => s.trim())
-    .filter(s => s.length >= 2);
-  return [...new Set(parts)].slice(0, max);
+    .filter(Boolean);
+
+  const out = new Set();
+  for (const tok of tokens) {
+    const isCJK = /[一-龥]/.test(tok);
+    if (!isCJK) {
+      // 英文/数字 token: 长度 ≥2 直接当关键词
+      if (tok.length >= 2) out.add(tok);
+      continue;
+    }
+    // ★ 中文 token: 没空格分词, 直接拿长词去 ilike 子串匹配几乎必落空 (老婆 v2.4 测试
+    //   "织哥是谁" 整串找不到)。改成切 2 字 shingle: 织哥/哥是/是谁 → "织哥" 能命中。
+    //   短词 (≤2 字) 整个用; 长词额外补 2-gram。
+    if (tok.length <= 2) {
+      out.add(tok);
+    } else {
+      for (let i = 0; i + 2 <= tok.length; i++) out.add(tok.slice(i, i + 2));
+    }
+  }
+  return [...out].slice(0, max);
 }
 
 export async function sbTextSearchMemories(env, query, opts = {}) {
