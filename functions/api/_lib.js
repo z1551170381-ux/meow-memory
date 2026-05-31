@@ -183,52 +183,57 @@ export async function sbMatchMemoriesByTypes(env, queryEmbedding, opts = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// sbMatchMemoriesByText (新窗小克 patch · 2026-05-27 · v2.4 BM25 通道)
-//   词面召回 — 跟 sbMatchMemories (向量) / sbMatchMemoriesByTypes (anchor) 三路并行
+// ★ v2.4 (老婆+小克 2026-05-31): 词面/关键词召回 (ilike, 不是严格 BM25)
+//   痛点: 纯向量召回"按意思找", 遇到搜原话里的具体词/名字 (reserved slots / 织哥)
+//         有时反而不准; 测试台那个 bm25=0 其实是功能从没实现。
+//   方案: 用 PostgREST ilike 做子串匹配 — 中文友好 (不需分词器), 零 Supabase 改动。
+//        从 query 切出关键词 (≥2 字), OR 起来在 content 上 ilike, 跟向量结果合并。
+//   局限: 没有词频排序 (所以叫"词面"不叫 BM25); 想要真排序得在 Supabase 建 tsvector 索引。
 //
-// 痛点:
-//   向量召回擅长语义, 但具体术语 query (PGRST102 / v143 / reserved slots) 经常跑偏。
-//   工程类 query 是老婆和 AI 协作的大头, 不能让它们被语义召回稀释掉。
-//
-// 设计:
-//   方案 A · ILIKE 多关键词 (中文友好, 不依赖分词扩展)
-//   按命中次数 SUM 排序, 阈值在 RPC 内部控制 (LENGTH(k) >= 2 过滤单字噪音)
-//
-// 用法:
-//   await sbMatchMemoriesByText(env, query, {
-//     topK: 5,
-//     filterPersona: cross_persona ? null : persona_id,
-//   });
-//
-// ★ 依赖: Supabase 上需要先创建 iw_match_memories_by_text RPC 函数
-//        (见 iw_match_memories_by_text.sql)
-//   优雅降级: 如果 RPC 还没创建, 返回 [] 不报错, 主流程不挂
+// @param {string} query - 原始查询串
+// @param {object} opts - { topK, filterPersona }
 // ═══════════════════════════════════════════════════════════════════
-export async function sbMatchMemoriesByText(env, searchText, opts = {}) {
-  if (!searchText || !String(searchText).trim()) return [];
+export function extractKeywords(query, max = 6) {
+  // 按空白和常见标点切, 留长度 ≥2 的词 (中文 2 字、英文 token), 去重
+  const parts = String(query || '')
+    .split(/[\s,，。、;；:：!！?？"'「」『』()（）\[\]【】<>《》/\\|~`@#$%^&*+=_\-]+/)
+    .map(s => s.trim())
+    .filter(s => s.length >= 2);
+  return [...new Set(parts)].slice(0, max);
+}
 
-  const body = {
-    search_text: String(searchText).trim(),
-    match_count: opts.topK ?? 5,
-    filter_types: Array.isArray(opts.types) && opts.types.length ? opts.types : null,
-    filter_persona: opts.filterPersona ?? null,
-    exclude_id: opts.excludeId ?? null,
-  };
-  const r = await fetch(env.SUPABASE_URL + '/rest/v1/rpc/iw_match_memories_by_text', {
-    method: 'POST',
-    headers: sbHeaders(env),
-    body: JSON.stringify(body),
-  });
+export async function sbTextSearchMemories(env, query, opts = {}) {
+  const keywords = extractKeywords(query);
+  if (!keywords.length) return [];
+
+  const url = new URL(env.SUPABASE_URL + '/rest/v1/iw_memories');
+  url.searchParams.set('select', 'id,content,type,metadata,persona_id,created_at,updated_at');
+
+  // or=(content.ilike.*kw1*,content.ilike.*kw2*) — PostgREST 里 * 是通配符
+  //   关键词里的逗号/括号/星号会破坏 PostgREST 语法, 先剔掉
+  const orClause = keywords
+    .map(kw => 'content.ilike.*' + kw.replace(/[(),*]/g, '') + '*')
+    .filter(c => c.length > 'content.ilike.**'.length)
+    .join(',');
+  if (!orClause) return [];
+  url.searchParams.set('or', '(' + orClause + ')');
+
+  // persona 过滤 (跨 scope 查时 filterPersona 传 null)
+  if (opts.filterPersona) {
+    url.searchParams.set('persona_id', 'eq.' + opts.filterPersona);
+  }
+  url.searchParams.set('limit', String(Math.min(Math.max(opts.topK || 10, 1), 30)));
+
+  const r = await fetch(url.toString(), { method: 'GET', headers: sbHeaders(env) });
   if (!r.ok) {
     const t = await r.text();
-    // 优雅降级 — 如果 RPC 还没创建(404 或 schema cache miss), 不报错, 返回空
-    if (r.status === 404 || /Could not find the function/i.test(t)) {
-      console.warn('[sbMatchMemoriesByText] RPC 未创建, 跳过 (请先在 Supabase 跑 iw_match_memories_by_text.sql)');
-      return [];
-    }
-    throw new Error('sbMatchMemoriesByText ' + r.status + ': ' + t.slice(0, 300));
+    // 优雅降级 — 词面召回挂了不该拖垮主向量召回
+    console.warn('[sbTextSearchMemories] ' + r.status + ': ' + t.slice(0, 200));
+    return [];
   }
-  return r.json();
+  const rows = await r.json();
+  // ilike 没有相似度, 给个标记分 (低于向量, 只作补充候选), 并标来源
+  return rows.map(row => ({ ...row, similarity: 0, text_match: true }));
 }
 
  // 插入一条记忆

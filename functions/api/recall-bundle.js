@@ -23,25 +23,12 @@
 //   设计原则: 单一职责 + 不破坏现有逻辑 + 完全向下兼容。
 //             旧客户端继续读 bundle.anchors / bundle.flashbacks,行为不变。
 //             新客户端可以读三个新字段拿到更全的记忆家数据。
-//
-// ★ v2.4 (新窗小克 patch · 2026-05-27 · BM25 词面通道):
-//   痛点: 向量召回擅长语义, 但工程类具体术语 query 经常跑偏
-//         ("PGRST102 是怎么修的" / "v143 改动" / "reserved slots 真凶")
-//         向量找的是"修 bug 的感觉", 召不准具体术语。
-//   修复: 加第三路并行 sbMatchMemoriesByText (ILIKE 多关键词词面召回),
-//         跟向量 + anchor reserved slots 三路并行融合。
-//         "不把所有功能压在一个人身上才不会塌" — 召回上的 manifesto (锚 #197)。
-//   行为: 优先级 anchor > BM25 > 向量 (后写覆盖前面的, 等同保持优先级)。
-//         BM25 命中给 fallback similarity=0.5 + source='text_match', 让排序能跑。
-//         text_score 跟 cosine similarity 不可比, 不做强排序融合, 只做"留位"。
-//   兼容: 优雅降级 — RPC 没创建时 sbMatchMemoriesByText 返回 [], 主流程不挂。
-//         bundle 顶层加 text_match_count 让测试平台能看 BM25 命中数。
 
 import {
   embed,
   sbMatchMemories,
   sbMatchMemoriesByTypes,  // ★ 老婆 patch: anchor reserved slots
-  sbMatchMemoriesByText,   // ★ v2.4: BM25 词面召回通道
+  sbTextSearchMemories,    // ★ v2.4: 词面/关键词召回 (补 bm25 缺口)
   sbSelectMemoriesByIds,
   sbHeaders,
   jsonResp,
@@ -537,32 +524,6 @@ function buildMemoryGroup(key, rows, query) {
   };
 }
 
-// ★ v143 (老婆 patch): 汇总所有 conv 提到的 anchor (作为"路牌索引")
-//   输入: conversations 数组 (每条带 related_anchors)
-//   输出: 按 anchor_name 分组的数组, 按 conv_count 降序排
-function aggregateAnchorsReferenced(conversations) {
-  const map = new Map();  // anchor_name → { anchor_name, role_label, tier, conv_count, conv_ids }
-  for (const conv of conversations) {
-    const list = Array.isArray(conv.related_anchors) ? conv.related_anchors : [];
-    for (const a of list) {
-      const key = a.anchor_name || '(无名)';
-      if (!map.has(key)) {
-        map.set(key, {
-          anchor_name: a.anchor_name || '',
-          role_label: a.role_label || '',
-          tier: a.tier || '',
-          conv_count: 0,
-          conv_ids: [],
-        });
-      }
-      const entry = map.get(key);
-      entry.conv_count += 1;
-      entry.conv_ids.push(conv.id);
-    }
-  }
-  return [...map.values()].sort((a, b) => b.conv_count - a.conv_count);
-}
-
 // ★ v2.2: 把跨 group 维度的 mood_period / old_path / conversation 汇总成 bundle 顶层字段
 //         主对话 AI 看 bundle 顶层就能拿到全套召回数据,不用挖 memory_groups 数组
 function collectTopLevelFromRows(rows) {
@@ -617,18 +578,12 @@ function collectTopLevelFromRows(rows) {
         ? [u ? '我说:' + u : '', a ? '对方接:' + a : ''].filter(Boolean).join(' / ')
         : asText(x.content, 400);
 
-      // ★ v143 (老婆 patch): 提取 conv 关联的 anchor 信息 (作为"路牌标签"附带)
-      //   背景: 老婆识别 ontology 错位 — type=anchor 实际是 AI 实时反思笔记,
-      //         真正的 anchor 由 conv 反复印证后浮现.
-      //         所以 conv 是主体, anchor 作为标签附在 conv 上, 才是正确返回结构.
-      //   数据源: m.linked_anchors / m.sourced_anchors / m.cumulative_anchors
-      //   每条形如 { role, role_label, anchor_id, anchor_name, tier, recall_kind }
+      // ★ v2.3: 提取 conv 关联的 anchor 信息 (作为"路牌标签"附带)
       const anchorSources = [
         ...(Array.isArray(m.linked_anchors) ? m.linked_anchors : []),
         ...(Array.isArray(m.sourced_anchors) ? m.sourced_anchors : []),
         ...(Array.isArray(m.cumulative_anchors) ? m.cumulative_anchors : []),
       ];
-      // 按 anchor_id 去重 (优先保留 linked > sourced > cumulative 的顺序)
       const seenIds = new Set();
       const related_anchors = [];
       for (const src of anchorSources) {
@@ -651,14 +606,47 @@ function collectTopLevelFromRows(rows) {
         source_id: cloudIdOf(x),
         source_url: sourceUrlOf(x),
         happened_at: m.happened_at || x.created_at || null,
-        related_anchors,  // ★ v143 新增
+        related_anchors,
+        // ★ v2.4 (老婆+小克 2026-05-31): 把记忆家躺在 metadata 里的"藤"读出来返回。
+        //   数据一直在云端 (conversation 上云时 tree.js 31413+ 全带了), 只是 bundle 之前没吐出来,
+        //   主对话 AI 召回到一条 conv 时看不到一句话总结/详细摘要/当天故事/当周故事 — 现在补上。
+        one_line:         asText(m.one_line, 120),                    // 15-30 字一句话总结 (Tab1)
+        detailed_summary: asText(m.detailed_summary, 220),           // 40-90 字详细摘要 (Tab2) — 中间粒度, 替"前后50字"
+        topic:            asText((m.cluster && m.cluster.title) || m.topic || '', 60),  // 真话题 = 话题簇标题
+        mood:             asText(m.mood || m.weather || '', 20),     // 当下氛围
+        day_summary:      asText(m.day_context && m.day_context.day_summary, 200),   // 当天故事 — 藤的茎
+        week_story:       asText(m.week_context && m.week_context.week_story, 240),  // 当周故事 — 藤的茎
       };
     });
 
   return { mood_periods: moods, old_paths: oldPaths, conversations };
 }
 
-function buildLegacyBundle(query, memoryGroups, rows, debug, body, textMatchCount = 0) {
+// ★ v2.3: 汇总所有 conv 提到的 anchor (按 anchor_name 分组计数)
+function aggregateAnchorsReferenced(conversations) {
+  const map = new Map();
+  for (const conv of conversations) {
+    const list = Array.isArray(conv.related_anchors) ? conv.related_anchors : [];
+    for (const a of list) {
+      const key = a.anchor_name || '(无名)';
+      if (!map.has(key)) {
+        map.set(key, {
+          anchor_name: a.anchor_name || '',
+          role_label: a.role_label || '',
+          tier: a.tier || '',
+          conv_count: 0,
+          conv_ids: [],
+        });
+      }
+      const entry = map.get(key);
+      entry.conv_count += 1;
+      entry.conv_ids.push(conv.id);
+    }
+  }
+  return [...map.values()].sort((a, b) => b.conv_count - a.conv_count);
+}
+
+function buildLegacyBundle(query, memoryGroups, rows, debug, body) {
   const firstGroup = memoryGroups[0] || null;
   const firstIdentity = rows.find(x => itemTypeOf(x) === 'identity_relation') || null;
 
@@ -666,15 +654,12 @@ function buildLegacyBundle(query, memoryGroups, rows, debug, body, textMatchCoun
   const topLevel = collectTopLevelFromRows(rows);
 
   const bundle = {
-    bundle_version: 'v2.4',                                  // ★ v2.4 升版 (BM25 词面召回通道)
+    bundle_version: 'v2.4',                                  // ★ v2.4: 藤字段 + 词面召回 (老婆能看出新版生效)
     query,
 
     // ★ v2.1: 让调用方清楚知道这次召回过滤了哪个 persona
     persona_id: body?.cross_persona ? null : (body?.persona_id || null),
     cross_persona: !!body?.cross_persona,
-
-    // ★ v2.4: BM25 词面通道这次返回了几条 (让测试平台 / 调用方能直观看)
-    text_match_count: textMatchCount,
 
     memory_groups: memoryGroups,
 
@@ -721,18 +706,12 @@ function buildLegacyBundle(query, memoryGroups, rows, debug, body, textMatchCoun
     mood_periods:  topLevel.mood_periods,
     old_paths:     topLevel.old_paths,
     conversations: topLevel.conversations,
-
-    // ★ v143 (老婆 patch): 汇总所有 conv 提到的 anchor (作为"路牌索引")
-    //   "锚只是标签" — 老婆原话. conv 是原文证据(主菜), anchor 是路牌索引.
     anchors_referenced: aggregateAnchorsReferenced(topLevel.conversations),
-
-    // ★ v143 (老婆 patch): ontology 说明 — 告诉调用方 AI 该怎么读这份 bundle
-    //   出处: 2026-05-27 老婆给出的三个定义
     ontology_hint: {
-      锚点: '一个能把一段记忆重新叫回来的路牌, 告诉你"从这里能回到那种感觉或主题"',
-      沉锚: '一个被反复走过、已经很熟的锚点, 能把人稳定带回某个关系位置或状态',
-      旧路: '几个沉锚之间反复走出来的一条回返路径, 记录"从哪里偏了、怎么回来、最后落到哪里"',
-      读法: 'conversations 是原文证据 (主菜, 有原文滋润); 每条 conv 的 related_anchors 标注它触发了哪个路牌; anchors_referenced 是路牌汇总索引',
+      锚点: '能把一段记忆重新叫回的路牌',
+      沉锚: '被反复走过的锚, 能稳定带回某关系位置或状态',
+      旧路: '几个沉锚之间反复走出的回返路径',
+      读法: 'conversations 是原文证据 (主菜); related_anchors 标注每条 conv 触发的路牌; anchors_referenced 是路牌汇总',
     },
 
     debug: {
@@ -806,10 +785,6 @@ export async function onRequestPost(context) {
     //   修法: 给 anchor 单独开一通道, 留 3 个保留位 + 宽 threshold (0.35 vs 主 0.5)
     //         因为 anchor 是浓缩信息, embedding 自然不如原文具体, 需要给"被看见的机会"
     //   优雅降级: 如果 RPC 还没创建, sbMatchMemoriesByTypes 返回空, 主流程不挂
-    //
-    // ★ v2.4 patch · BM25 词面召回 (2026-05-27)
-    //   再加第三路: 词面 ILIKE 匹配, 救工程具体术语 query (PGRST102 / v143 等)
-    //   三路并行, 优先级 anchor > BM25 > 向量 (Map 后写覆盖, 实际等同优先级)
     // ═══════════════════════════════════════════════════════════
 
     const [mainMatches, anchorMatches, textMatches] = await Promise.all([
@@ -822,31 +797,32 @@ export async function onRequestPost(context) {
         threshold: 0.35,
         filterPersona: cross_persona ? null : persona_id,
       }),
-      // ★ v2.4 通道 3 · BM25 词面召回 (留 5 个位, 救具体术语 query)
-      sbMatchMemoriesByText(env, query, {
-        topK: 5,
+      // ★ v2.4 通道 3 · 词面召回 (ilike 关键词) — 补向量搜不到"具体词/名字"的缺口
+      sbTextSearchMemories(env, query, {
+        topK: 10,
         filterPersona: cross_persona ? null : persona_id,
       }),
     ]);
 
-    // 合并去重 — Map 按 id 去重, 优先级 anchor > BM25 > 向量主路
+    // 合并去重 — Map 按 id 去重, anchor 先放 (优先级高), 主查询再覆盖
     //   注意: anchor 通道已经 persona 过滤了, 主查询的 anchor 会有重复, 但 Map 自动去重
-    //   BM25 命中没有 similarity 字段 (它返回的是 text_score), 给 fallback 让下游排序能跑
     const matchesMap = new Map();
     anchorMatches.forEach(m => matchesMap.set(String(m.id), m));
-    textMatches.forEach(m => {
-      if (!matchesMap.has(String(m.id))) {
-        // ★ v2.4: BM25 命中给 fallback similarity, text_score 跟 cosine 不可比, 只是留位
-        matchesMap.set(String(m.id), { ...m, similarity: 0.5, source: 'text_match' });
-      }
-    });
     mainMatches.forEach(m => {
       if (!matchesMap.has(String(m.id))) matchesMap.set(String(m.id), m);
+    });
+    // ★ v2.4: 词面命中的, 只补"向量没召回到"的 (similarity=0, 不抢向量排序)
+    let textOnlyCount = 0;
+    textMatches.forEach(m => {
+      if (!matchesMap.has(String(m.id))) {
+        matchesMap.set(String(m.id), m);
+        textOnlyCount++;
+      }
     });
     const matches = [...matchesMap.values()];
 
     // 诊断日志 — 让老婆能在 Cloudflare logs 看 anchor 是不是被召回了
-    console.log('[recall-bundle] three-channel recall', {
+    console.log('[recall-bundle] anchor reserved slots', {
       query: query.slice(0, 60),
       persona_id: cross_persona ? '(cross)' : persona_id,
       main_matches: mainMatches.length,
@@ -854,7 +830,6 @@ export async function onRequestPost(context) {
         ['anchor', 'core_anchor', 'identity_relation'].includes(m.type)
       ).length,
       anchor_channel_count: anchorMatches.length,
-      text_channel_count: textMatches.length,  // ★ v2.4: BM25 命中数
       merged_total: matches.length,
     });
 
@@ -889,7 +864,11 @@ export async function onRequestPost(context) {
       .sort((a, b) => b.score - a.score)
       .slice(0, maxGroups);
 
-    return jsonResp(buildLegacyBundle(query, memoryGroups, allRows, !!body.debug, body, textMatches.length));
+    const bundle = buildLegacyBundle(query, memoryGroups, allRows, !!body.debug, body);
+    // ★ v2.4: 词面召回统计 — 测试台读的就是这个字段 (之前一直 undefined → 显示 0)
+    bundle.text_match_count = textMatches.length;
+    bundle.text_only_count = textOnlyCount;  // 纯靠词面捞回 (向量没命中) 的条数
+    return jsonResp(bundle);
   } catch (err) {
     console.error('[recall-bundle:v2.2] error:', err);
     return jsonResp({ error: String(err.message || err) }, 500);

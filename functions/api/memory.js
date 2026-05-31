@@ -7,7 +7,44 @@
 // - 召回默认按当前 persona 过滤;cross_persona=true 才跨 scope 查
 // - 写入和召回都带 persona
 
-import { embed, sbInsertMemory, sbMatchMemories, jsonResp, corsPreflight } from './_lib.js';
+import { embed, sbInsertMemory, sbMatchMemories, sbSelectMemoriesByIds, jsonResp, corsPreflight } from './_lib.js';
+
+// ★ v2.4 (老婆+小克 2026-05-31): 把记忆家躺在 metadata 里的"藤"塑形成中等档返回。
+//   存记忆是用得最多的路径, 但之前 save 完只返回 3 条裸 content, 看不到一句话总结/
+//   详细摘要/当天故事/挂的锚。现在 save 时也能看到丰富召回 (中等档 = one_line +
+//   detailed_summary + 当天故事 + 挂的锚), 帮模型记得更准、更容易挂到已有的藤上。
+function shapeRelatedRow(row) {
+  const m = (row && typeof row.metadata === 'object' && row.metadata) || {};
+  const anchorList = [
+    ...(Array.isArray(m.linked_anchors) ? m.linked_anchors : []),
+    ...(Array.isArray(m.sourced_anchors) ? m.sourced_anchors : []),
+  ];
+  const seen = new Set();
+  const anchors = [];
+  for (const a of anchorList) {
+    const name = a && (a.anchor_name || a.name);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    anchors.push(a.role_label ? `${a.role_label}:${name}` : name);
+  }
+  const cut = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  return {
+    id: row.id,
+    type: row.type,
+    persona_id: row.persona_id,
+    similarity: Math.round(Number(row.similarity || 0) * 100) / 100,
+    created_at: row.created_at,
+    // 中等档藤: 由轻到重
+    one_line:         cut(m.one_line, 120),
+    detailed_summary: cut(m.detailed_summary, 220),
+    topic:            cut((m.cluster && m.cluster.title) || m.topic, 60),
+    mood:             cut(m.mood || m.weather, 20),
+    day_summary:      cut(m.day_context && m.day_context.day_summary, 200),
+    anchors:          anchors.slice(0, 4),
+    // 没有 one_line 的老数据 fallback 给一段 content 预览
+    content_preview:  m.one_line ? '' : cut(row.content, 160),
+  };
+}
 
 // ★ persona_id 枚举(和 schema.md / 数据库 CHECK 约束保持一致)
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'system'];
@@ -47,17 +84,40 @@ export async function onRequestPost(context) {
     }
 
     // 算 embedding
-    const vector = await embed(content, env);
+    // ★ v2.4 (老婆拍板): content + summary 一起算向量。
+    //   小便签场景下模型在 metadata.summary 写 40-90 字事件骨架, 之前只 embed content,
+    //   summary 的关键词进不了向量、搜不到 — 现在拼进去, 标签从"摆设"变"召回燃料"。
+    //   小天气情绪词也一起拼 (轻量), 让"按情绪回忆"也能命中。
+    const sw = metadata.small_weather;
+    const swText = sw ? (typeof sw === 'string' ? sw : [sw.level, sw.texture].filter(Boolean).join(' ')) : '';
+    const embedInput = [content, metadata.summary || '', swText].filter(Boolean).join('\n');
+    const vector = await embed(embedInput, env);
 
     // 先查相关旧记忆(写入之前,避免查到自己)
     // ★ 默认按当前 persona 过滤;cross_persona=true 时跨 scope 查
+    // ★ v2.4: 中等档 — topK 3→5, 命中后补查完整 metadata (sbMatchMemories 的 RPC
+    //   只返回轻量字段, 跟 recall-bundle 一样要再 sbSelectMemoriesByIds 取 metadata)
     let related = [];
     try {
-      related = await sbMatchMemories(env, vector, {
-        topK: 3,
+      const hits = await sbMatchMemories(env, vector, {
+        topK: 5,
         threshold: 0.5,
         filterPersona: cross_persona ? null : persona_id,
       });
+      if (hits.length) {
+        const fullRows = await sbSelectMemoriesByIds(env, hits.map(h => h.id));
+        const rowMap = new Map(fullRows.map(r => [String(r.id), r]));
+        // 用补查的完整行 (带 metadata), 保留 RPC 算出的 similarity
+        related = hits.map(h => ({
+          ...(rowMap.get(String(h.id)) || {}),
+          id: h.id,
+          content: (rowMap.get(String(h.id)) || {}).content ?? h.content,
+          type: (rowMap.get(String(h.id)) || {}).type ?? h.type,
+          persona_id: (rowMap.get(String(h.id)) || {}).persona_id ?? h.persona_id,
+          created_at: (rowMap.get(String(h.id)) || {}).created_at ?? h.created_at,
+          similarity: h.similarity,
+        }));
+      }
     } catch (e) {
       console.warn('[memory] 查相似失败(可能库还空):', e.message);
     }
@@ -77,14 +137,8 @@ export async function onRequestPost(context) {
       persona_id: saved.persona_id,
       created_at: saved.created_at,
       cross_persona,  // 让调用方知道这次召回是不是跨 scope
-      related: related.map(r => ({
-        id: r.id,
-        content: r.content,
-        type: r.type,
-        persona_id: r.persona_id,  // ★ 返回值带 persona,UI 能区分是谁的
-        similarity: Math.round(r.similarity * 100) / 100,
-        created_at: r.created_at,
-      })),
+      // ★ v2.4: 中等档藤 — 给模型看的精简结构 (one_line/detailed_summary/当天故事/挂的锚)
+      related: related.map(shapeRelatedRow),
     });
 
   } catch (err) {
