@@ -18,7 +18,7 @@
 //   - persona_id 改成"可选"(因为 URL 已经有了),tool description 提示"通常不用填"
 //   - cross_persona 仍然保留,想跨 scope 查时显式传
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
 
 const TOOLS = [
   {

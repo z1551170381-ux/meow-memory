@@ -47,7 +47,7 @@ function shapeRelatedRow(row) {
 }
 
 // ★ persona_id 枚举(和 schema.md / 数据库 CHECK 约束保持一致)
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
 
 export async function onRequestOptions() {
   return corsPreflight();
