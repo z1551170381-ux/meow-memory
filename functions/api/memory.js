@@ -49,6 +49,49 @@ function shapeRelatedRow(row) {
 // ★ persona_id 枚举(和 schema.md / 数据库 CHECK 约束保持一致)
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
 
+// ★ 2026-06-03 (老婆+小野): 存记忆时把 metadata 归一成标准格式 —— 代码层一道保险。
+//   提示词/description 管"让 AI 尽量填对", 这里管"填不对也纠正成统一格式",
+//   省得各 persona 手写五花八门、记忆家收录时对不齐。保守处理, 不丢有效信息。
+function normalizeMetadata(raw) {
+  const m = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? { ...raw } : {};
+
+  // 1. 不打分: 删掉评分类字段(强制"用 note 短留言代替温度评分")
+  delete m.ai_score;
+  delete m.score;
+  delete m.temperature;
+
+  // 2. keywords 统一成字符串数组(接受 数组 / 逗号或空格分隔的字符串)
+  const toList = (v) => Array.isArray(v)
+    ? v.map(x => String(x).trim()).filter(Boolean)
+    : String(v || '').split(/[,，;；\s]+/).map(s => s.trim()).filter(Boolean);
+  if (m.keywords != null) m.keywords = toList(m.keywords);
+
+  // 3. tags 并入 keywords(不留两套), 然后删掉 tags
+  if (m.tags != null) {
+    m.keywords = [...new Set([...(m.keywords || []), ...toList(m.tags)])];
+    delete m.tags;
+  }
+  if (Array.isArray(m.keywords) && m.keywords.length === 0) delete m.keywords;
+
+  // 4. atmosphere 归到 mood(同一个"氛围/感受"别两套)
+  if (m.atmosphere && !m.mood) m.mood = m.atmosphere;
+  delete m.atmosphere;
+
+  // 5. note 去首尾空白(短留言, 不硬截断免得切坏意思)
+  if (typeof m.note === 'string') m.note = m.note.trim();
+
+  // 6. small_weather 是对象时只保留 level/texture 两个标准键
+  const sw = m.small_weather;
+  if (sw && typeof sw === 'object' && !Array.isArray(sw)) {
+    const clean = {};
+    if (sw.level) clean.level = String(sw.level).trim();
+    if (sw.texture) clean.texture = String(sw.texture).trim();
+    m.small_weather = clean;
+  }
+
+  return m;
+}
+
 export async function onRequestOptions() {
   return corsPreflight();
 }
@@ -60,7 +103,7 @@ export async function onRequestPost(context) {
     const body = await request.json();
     const content = (body.content || '').trim();
     const type = (body.type || 'note').trim();
-    const metadata = body.metadata || {};
+    const metadata = normalizeMetadata(body.metadata);
     const persona_id = (body.persona_id || '').trim();
     const cross_persona = body.cross_persona === true;
 
@@ -90,7 +133,11 @@ export async function onRequestPost(context) {
     //   小天气情绪词也一起拼 (轻量), 让"按情绪回忆"也能命中。
     const sw = metadata.small_weather;
     const swText = sw ? (typeof sw === 'string' ? sw : [sw.level, sw.texture].filter(Boolean).join(' ')) : '';
-    const embedInput = [content, metadata.summary || '', swText].filter(Boolean).join('\n');
+    // ★ 2026-06-02 (老婆): topic + keywords 也拼进向量 — 标签从"摆设"变"召回燃料",
+    //   省得每次都把关键词重抄进 summary 才搜得到。
+    const kw = metadata.keywords;
+    const kwText = Array.isArray(kw) ? kw.join(' ') : (kw || '');
+    const embedInput = [content, metadata.summary || '', metadata.topic || '', kwText, swText].filter(Boolean).join('\n');
     const vector = await embed(embedInput, env);
 
     // 先查相关旧记忆(写入之前,避免查到自己)

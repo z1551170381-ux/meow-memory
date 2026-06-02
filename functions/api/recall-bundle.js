@@ -357,9 +357,10 @@ function rowScore(row) {
   const t = itemTypeOf(row);
 
   // ★ v2.2: core_anchor 跟 anchor 同级 boost,mood_period / old_path 给小 boost
+  // ★ 2026-06-02 (老婆): fact/preference 跟 identity_relation 同档 — 三类"人格纹理"都高优
   const typeBoost =
     t === 'anchor' || t === 'core_anchor' ? 0.08 :
-    t === 'identity_relation' ? 0.08 :
+    t === 'identity_relation' || t === 'fact' || t === 'preference' ? 0.08 :
     t === 'weather_capsule' ? 0.05 :
     t === 'mood_period' ? 0.05 :
     t === 'old_path' ? 0.04 :
@@ -422,6 +423,7 @@ function hitReasonFor(groupRows, anchor, weather, query) {
   if (hitTypes.includes('conversation'))    return '原文语义命中';
   if (hitTypes.includes('anchor') || hitTypes.includes('core_anchor')) return '锚点命中';  // ★ v2.2
   if (hitTypes.includes('identity_relation')) return '身份/关系命中';
+  if (hitTypes.includes('fact') || hitTypes.includes('preference')) return '事实/偏好命中';  // ★ 2026-06-02
   if (hitTypes.includes('old_path'))        return '旧路命中';            // ★ v2.2
   if (weather) return '天气关联展开';
   if (anchor)  return '锚点关联展开';
