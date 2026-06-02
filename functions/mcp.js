@@ -20,6 +20,84 @@
 
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
 
+const ASSOC_LINK_TOOLS = [
+  {
+    name: 'suggest_assoc_links',
+    description: 'Search the assistant association lamp for links that light up from the current text. Usually persona_id is inferred from the MCP URL.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Current user/assistant text to test against association triggers.' },
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        topK: { type: 'integer', default: 5 },
+        include_blocks: { type: 'boolean', default: false }
+      },
+      required: ['text']
+    }
+  },
+  {
+    name: 'save_assoc_link',
+    description: 'Save a soft assistant/user/shared association link. Stored as type=note with metadata.assoc_kind.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        assoc_kind: { type: 'string', enum: ['assistant_link', 'user_link', 'shared_link'], default: 'assistant_link' },
+        triggers: { type: 'array', items: { type: 'string' } },
+        target: { type: 'string' },
+        why: { type: 'string' },
+        tone: { type: 'string' },
+        strength: { type: 'number', default: 0.35 },
+        status: { type: 'string', default: 'soft_active' },
+        content: { type: 'string' },
+        metadata: { type: 'object' }
+      }
+    }
+  },
+  {
+    name: 'strengthen_assoc_link',
+    description: 'Strengthen one association link after it proved useful.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        delta: { type: 'number', default: 0.08 },
+        status: { type: 'string' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'block_assoc_pattern',
+    description: 'Save an association block rule, for patterns the assistant should stop lighting up.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        triggers: { type: 'array', items: { type: 'string' } },
+        why: { type: 'string' },
+        blocks_kind: { type: 'string', default: 'assistant_link' },
+        metadata: { type: 'object' }
+      },
+      required: ['triggers']
+    }
+  },
+  {
+    name: 'list_assoc_links',
+    description: 'List association links in this persona scope.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        limit: { type: 'integer', default: 100 },
+        include_blocks: { type: 'boolean', default: true },
+        include_deleted: { type: 'boolean', default: false }
+      }
+    }
+  }
+];
+
 const TOOLS = [
   {
     name: 'save_memory',
@@ -138,7 +216,8 @@ const TOOLS = [
       },
       required: ['query']
     }
-  }
+  },
+  ...ASSOC_LINK_TOOLS
 ];
 
 const CORS_HEADERS = {
@@ -320,6 +399,68 @@ export async function onRequestPost({ request }) {
             topK: args.topK || 20,
             minSimilarity: args.minSimilarity ?? 0.3,
             debug: !!args.debug
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'suggest_assoc_links') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'suggest',
+            text: args.text || args.query || '',
+            persona_id: effectivePersona,
+            topK: args.topK || 5,
+            include_blocks: args.include_blocks === true
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'save_assoc_link') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'save',
+            persona_id: effectivePersona,
+            assoc_kind: args.assoc_kind || 'assistant_link',
+            triggers: args.triggers || args.trigger || [],
+            target: args.target || '',
+            why: args.why || '',
+            tone: args.tone || '',
+            strength: args.strength,
+            status: args.status || 'soft_active',
+            content: args.content || '',
+            metadata: args.metadata || {}
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'strengthen_assoc_link') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'strengthen',
+            id: args.id,
+            persona_id: effectivePersona,
+            delta: args.delta,
+            status: args.status
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'block_assoc_pattern') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'block',
+            persona_id: effectivePersona,
+            triggers: args.triggers || args.trigger || [],
+            why: args.why || '',
+            blocks_kind: args.blocks_kind || 'assistant_link',
+            metadata: args.metadata || {}
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'list_assoc_links') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'list',
+            persona_id: effectivePersona,
+            limit: args.limit || 100,
+            include_blocks: args.include_blocks !== false,
+            include_deleted: args.include_deleted === true
           });
           return mcpTextResult(id, data);
         }

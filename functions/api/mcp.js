@@ -20,14 +20,122 @@
 
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
 
-const TOOLS = [
+const DIRECT_SAVE_TYPE_GUIDE = [
+  '模型直存记忆类型:',
+  '- identity_relation: 身份/关系/长期角色,如“我是...”“你是...”“我们之间...”。',
+  '- fact: 稳定事实,如真实发生过的事、长期背景、项目状态、重要决定。',
+  '- preference: 偏好/雷区/表达习惯,如喜欢什么、不喜欢什么、希望怎样被回应。',
+  '- note: 拿不准时的安全类型; daily/diary/idea 可用于日常感受、日记、灵感。',
+  '不要用 save_memory 手写 anchor/quote/continuation_bundle;这些由记忆家整理后通过批量上传进入云端。'
+].join('\n');
+
+const MEMORY_HOME_BATCH_TYPE_GUIDE = [
+  '记忆家批量上传类型:',
+  '- identity_relation: 身份/关系/长期角色。',
+  '- fact: 稳定事实/长期背景/项目状态/重要决定。',
+  '- preference: 偏好/雷区/表达习惯。',
+  '- anchor: 记忆家 P0/P1/P2/P3 整理出的锚点/回返位置。',
+  '- quote: 记忆家保留的摘句/原文证据,尽量带 source_id/source_url。',
+  '- continuation_bundle: 续火包/阶段总结,包含身份、事实、偏好、锚点、证据和下一步。',
+  '- weather_capsule/flashback_token/daily/diary/idea/note: 小天气、召回 token 和辅助材料。'
+].join('\n');
+
+const METADATA_GUIDE = [
+  'metadata 建议:',
+  '- summary: 40-90字事件骨架,会和 content 一起算向量;关键词、人名、概念写进去才搜得到。',
+  '- small_weather: { level, texture }。level 可用 微风/小雨/起雾/风变大/雷声很近;普通聊天少用高强度。texture 写轻轻/暖/松/隐隐/被接住/刺痛等;意象词可自由发挥。',
+  '- topic: 可选,具体话题要带事件形状,如“reserved slots 真凶定位”,不要只写“工程bug”。',
+  '- anchor_signal: 可选,如果这条像某个锚的苗头,写一句它像什么。',
+  '- linked_anchors: 可选,[{ anchor_name, role }],用于挂到已有锚。',
+  '不要填 ai_score,不做温度评分,不重复 topic/tags 两套。'
+].join('\n');
+
+const ASSOC_LINK_TOOLS = [
   {
-    name: 'save_memory',
-    description: '保存一条记忆到云端 iw_memories 表。通常不需要填 persona_id —— MCP server 会从 URL 自动推断;只有想"替别人记一笔"时才显式填。',
+    name: 'suggest_assoc_links',
+    description: 'Search the assistant association lamp for links that light up from the current text. Usually persona_id is inferred from the MCP URL.',
     inputSchema: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: '要保存的记忆内容,第一人称(我...而不是"用户...")' },
+        text: { type: 'string', description: 'Current user/assistant text to test against association triggers.' },
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        topK: { type: 'integer', default: 5 },
+        include_blocks: { type: 'boolean', default: false }
+      },
+      required: ['text']
+    }
+  },
+  {
+    name: 'save_assoc_link',
+    description: 'Save a soft assistant/user/shared association link. Stored as type=note with metadata.assoc_kind.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        assoc_kind: { type: 'string', enum: ['assistant_link', 'user_link', 'shared_link'], default: 'assistant_link' },
+        triggers: { type: 'array', items: { type: 'string' } },
+        target: { type: 'string' },
+        why: { type: 'string' },
+        tone: { type: 'string' },
+        strength: { type: 'number', default: 0.35 },
+        status: { type: 'string', default: 'soft_active' },
+        content: { type: 'string' },
+        metadata: { type: 'object' }
+      }
+    }
+  },
+  {
+    name: 'strengthen_assoc_link',
+    description: 'Strengthen one association link after it proved useful.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        delta: { type: 'number', default: 0.08 },
+        status: { type: 'string' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'block_assoc_pattern',
+    description: 'Save an association block rule, for patterns the assistant should stop lighting up.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        triggers: { type: 'array', items: { type: 'string' } },
+        why: { type: 'string' },
+        blocks_kind: { type: 'string', default: 'assistant_link' },
+        metadata: { type: 'object' }
+      },
+      required: ['triggers']
+    }
+  },
+  {
+    name: 'list_assoc_links',
+    description: 'List association links in this persona scope.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        persona_id: { type: 'string', enum: PERSONA_IDS, description: 'Usually omit; inferred from URL.' },
+        limit: { type: 'integer', default: 100 },
+        include_blocks: { type: 'boolean', default: true },
+        include_deleted: { type: 'boolean', default: false }
+      }
+    }
+  }
+];
+
+const TOOLS = [
+  {
+    name: 'save_memory',
+    description: '保存一条记忆到云端 iw_memories 表。通常不需要填 persona_id —— MCP server 会从 URL 自动推断;只有想"替别人记一笔"时才显式填。\n\n' + DIRECT_SAVE_TYPE_GUIDE,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: '要保存的记忆内容。优先第一人称、短而具体、可独立召回;不要写成“用户说...”。' },
         persona_id: {
           type: 'string',
           enum: PERSONA_IDS,
@@ -35,13 +143,13 @@ const TOOLS = [
         },
         type: {
           type: 'string',
-          enum: ['daily', 'diary', 'idea', 'anchor', 'note', 'identity_relation'],
+          enum: ['identity_relation', 'fact', 'preference', 'daily', 'diary', 'idea', 'note'],
           default: 'note',
-          description: '记忆类型:daily=当日感受,diary=日记,idea=想法/灵感,anchor=锚点(已稳定主题),note=拿不准的安全选项,identity_relation=关系/身份描述'
+          description: DIRECT_SAVE_TYPE_GUIDE
         },
         metadata: {
           type: 'object',
-          description: '可选 metadata 杂物抽屉,装 tags/mood/weight 等'
+          description: METADATA_GUIDE
         }
       },
       required: ['content']
@@ -72,7 +180,7 @@ const TOOLS = [
   },
   {
     name: 'meow_memory_upsert_batch',
-    description: '把记忆家整理出的摘句、锚点、天气胶囊、flashback token 批量同步到云端 iw_memories。通常不用填 persona_id —— 从 URL 自动推断;有特殊情况(替别人批量同步)才显式填。',
+    description: '把记忆家整理出的身份、事实、偏好、锚点、摘句、续火包、天气胶囊、flashback token 批量同步到云端 iw_memories。通常不用填 persona_id —— 从 URL 自动推断;有特殊情况(替别人批量同步)才显式填。\n\n' + MEMORY_HOME_BATCH_TYPE_GUIDE,
     inputSchema: {
       type: 'object',
       properties: {
@@ -90,10 +198,11 @@ const TOOLS = [
           items: {
             type: 'object',
             properties: {
-              content: { type: 'string' },
+              content: { type: 'string', description: '这一条要写入云端的正文。优先短、具体、可召回;续火包可以较长但要结构清楚。' },
               item_type: {
                 type: 'string',
-                enum: ['identity_relation', 'anchor', 'weather_capsule', 'flashback_token', 'quote', 'note']
+                enum: ['identity_relation', 'fact', 'preference', 'anchor', 'quote', 'continuation_bundle', 'weather_capsule', 'flashback_token', 'daily', 'diary', 'idea', 'note'],
+                description: MEMORY_HOME_BATCH_TYPE_GUIDE
               },
               persona_id: {
                 type: 'string',
@@ -105,7 +214,7 @@ const TOOLS = [
               source_url: { type: 'string' },
               tags: { type: 'array', items: { type: 'string' } },
               weight: { type: 'number' },
-              metadata: { type: 'object' }
+              metadata: { type: 'object', description: METADATA_GUIDE }
             },
             required: ['content']
           }
@@ -138,7 +247,8 @@ const TOOLS = [
       },
       required: ['query']
     }
-  }
+  },
+  ...ASSOC_LINK_TOOLS
 ];
 
 const CORS_HEADERS = {
@@ -215,7 +325,7 @@ export async function onRequestGet({ request }) {
   return json({
     name: 'meow-memory MCP server',
     status: 'ok',
-    version: '0.4.0',
+    version: '0.4.1',
     inferred_persona: inferredPersona || '(未配置 URL ?persona= 参数)',
     hint: 'POST this URL with JSON-RPC 2.0 messages',
     tools: TOOLS.map(t => t.name)
@@ -254,11 +364,11 @@ export async function onRequestPost({ request }) {
             capabilities: { tools: {} },
             serverInfo: {
               name: 'meow-memory',
-              version: '0.4.0'
+              version: '0.4.1'
             },
             instructions: inferredPersona
-              ? `meow-memory 云端记忆接口。当前 scope: ${inferredPersona}。所有写入/查询会自动按这个 scope 进行,你无需在 args 里再传 persona_id。`
-              : 'meow-memory 云端记忆接口。⚠ 当前 URL 未配 ?persona= 参数,所以工具调用必须显式传 persona_id;建议在 MCP 客户端配置里把 URL 改成 .../api/mcp?persona=你的角色名,这样后续都不用再传。'
+              ? `meow-memory 云端记忆接口。当前 scope: ${inferredPersona}。所有写入/查询会自动按这个 scope 进行,你无需在 args 里再传 persona_id。\n\n${DIRECT_SAVE_TYPE_GUIDE}`
+              : `meow-memory 云端记忆接口。⚠ 当前 URL 未配 ?persona= 参数,所以工具调用必须显式传 persona_id;建议在 MCP 客户端配置里把 URL 改成 .../api/mcp?persona=你的角色名,这样后续都不用再传。\n\n${DIRECT_SAVE_TYPE_GUIDE}`
           }
         });
 
@@ -320,6 +430,68 @@ export async function onRequestPost({ request }) {
             topK: args.topK || 20,
             minSimilarity: args.minSimilarity ?? 0.3,
             debug: !!args.debug
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'suggest_assoc_links') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'suggest',
+            text: args.text || args.query || '',
+            persona_id: effectivePersona,
+            topK: args.topK || 5,
+            include_blocks: args.include_blocks === true
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'save_assoc_link') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'save',
+            persona_id: effectivePersona,
+            assoc_kind: args.assoc_kind || 'assistant_link',
+            triggers: args.triggers || args.trigger || [],
+            target: args.target || '',
+            why: args.why || '',
+            tone: args.tone || '',
+            strength: args.strength,
+            status: args.status || 'soft_active',
+            content: args.content || '',
+            metadata: args.metadata || {}
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'strengthen_assoc_link') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'strengthen',
+            id: args.id,
+            persona_id: effectivePersona,
+            delta: args.delta,
+            status: args.status
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'block_assoc_pattern') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'block',
+            persona_id: effectivePersona,
+            triggers: args.triggers || args.trigger || [],
+            why: args.why || '',
+            blocks_kind: args.blocks_kind || 'assistant_link',
+            metadata: args.metadata || {}
+          });
+          return mcpTextResult(id, data);
+        }
+
+        if (name === 'list_assoc_links') {
+          const data = await callApi(origin, '/api/assoc-links', {
+            action: 'list',
+            persona_id: effectivePersona,
+            limit: args.limit || 100,
+            include_blocks: args.include_blocks !== false,
+            include_deleted: args.include_deleted === true
           });
           return mcpTextResult(id, data);
         }
