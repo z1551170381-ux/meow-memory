@@ -20,17 +20,35 @@
 
 const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
 
-const DIRECT_SAVE_TYPE_GUIDE = [
-  '模型直存记忆类型:',
-  'identity_relation / fact / preference 是“人格纹理”——慢慢积累的高优记忆,召回时会高优浮现,不必每轮记。',
-  '- identity_relation: 身份/关系/长期角色,如“我是...”“你是...”“我们之间...”。',
-  '- fact: 站得住的稳定事实——真实发生过的事、长期背景、项目状态、重要决定。新见解别当轮硬记成 fact;等联想闭环、它站住了再沉淀成 fact。',
-  '- preference: 偏好/雷区/表达习惯——喜欢什么、不喜欢什么、希望怎样被回应。',
-  '- note(拿不准的安全类型)/ daily / diary / idea: 日常感受、日记、灵感;刚冒头的新见解可先记 idea。',
-  '不要用 save_memory 手写 anchor/quote/continuation_bundle;这些由记忆家整理后通过批量上传进入云端。'
+const METADATA_GUIDE = [
+  'metadata 这才是必填固定格式,严格照此填,不要增减固定层字段:',
+  '{',
+  '  "summary": "40-90字事件骨架,把关键词/人名/概念都写进去(会和 content/topic/keywords/small_weather 一起算向量,搜得到)",',
+  '  "topic": "具体话题+事件标识,如 reserved slots 真凶定位,不要只写 工程bug",',
+  '  "keywords": ["词1", "词2", "词3"],',
+  '  "mood": "当下氛围/感受,一个词或短语",',
+  '  "atmosphere": "氛围补充;没有就填空字符串",',
+  '  "small_weather": { "level": "微风/小雨/起雾/风变大/雷声很近之一或类似强度", "texture": "轻轻/暖/松/隐隐/被接住/刺痛等质地" }',
+  '}',
+  'note 可选,≤10字当下感受;没有就不填。',
+  '锚字段可选: anchor_signal 写一句它像什么; linked_anchors 用 [{ "anchor_name": "...", "role": "..." }] 挂到已有锚。',
+  '返记忆感想可选: recall_note 写 save 后看到相关旧记忆时冒出的≤10字新感想,用于在已有藤上轻轻补一句。',
+  '联想场字段可选: insight 写这次冒出的新见解; preference_env 写它靠近的偏好环境; assoc_field 写“当下关键词+旧记忆+偏好方向”碰撞出的联想场。',
+  '禁止字段: 不要写 tags、weight、ai_score。不要手写 anchor/quote/continuation_bundle;锚点/摘句/续火包交给记忆家整理层。'
+].join('\n');
+
+const OPTIONAL_TEXTURE_GUIDE = [
+  '可选补充三类(看情况,不是每次都填):',
+  '1. 人格纹理: identity_relation / fact / preference。只在身份/事实/偏好确实稳定或发生变化时使用,后期可微调编辑。',
+  '   - identity_relation: 身份/关系/长期角色,如“我是...”“你是...”“我们之间...”。',
+  '   - fact: 站得住的稳定事实,如真实发生过的事、长期背景、项目状态、重要决定。新见解别当轮硬记成 fact;等联想闭环、它站住了再沉淀。',
+  '   - preference: 偏好/雷区/表达习惯,如喜欢什么、不喜欢什么、希望怎样被回应。',
+  '2. 锚: 不手写 anchor/quote/continuation_bundle;只在 metadata.anchor_signal / linked_anchors 里写苗头,交给记忆家整理层。',
+  '3. 联想场/联想边: 在 metadata.insight / preference_env / assoc_field 里简短记录;真正的助手联想边用 save_assoc_link 另存 soft_active。'
 ].join('\n');
 
 const MEMORY_HOME_BATCH_TYPE_GUIDE = [
+  '注意:这是记忆家整理层/批量导入 meow_memory_upsert_batch 的 item_type,不是模型日常 save_memory 需要填写的 type 格式。',
   '记忆家批量上传类型:',
   '- identity_relation: 身份/关系/长期角色。',
   '- fact: 稳定事实/长期背景/项目状态/重要决定。',
@@ -41,20 +59,13 @@ const MEMORY_HOME_BATCH_TYPE_GUIDE = [
   '- weather_capsule/flashback_token/daily/diary/idea/note: 小天气、召回 token 和辅助材料。'
 ].join('\n');
 
-const METADATA_GUIDE = [
-  'metadata 建议(分两层):',
-  '【固定层 · 当下顺手填】记的是“被触动那一刻”的快照:',
-  '- summary: 40-90字事件骨架。会和 content/topic/keywords/small_weather 一起算向量;关键词、人名、概念写进去才搜得到。',
-  '- mood / atmosphere: 当时的氛围或感受。',
-  '- topic: 具体话题要带事件形状,如“reserved slots 真凶定位”,不要只写“工程bug”(现在会进向量)。',
-  '- keywords: 当下碰撞出的关键词(现在会进向量,能直接搜到)。',
-  '- small_weather: { level, texture }。level 可用 微风/小雨/起雾/风变大/雷声很近;普通聊天少用高强度。texture 写轻轻/暖/松/隐隐/被接住/刺痛等;意象词可自由发挥。',
-  '- note: 可选,≤10字短留言。这条让你有触动时,留一句当下的感受/体温——不打分,“愿意留一句”本身就是权重。',
-  '【可选三类 · 看情况】',
-  '- 人格纹理: 用 type=identity_relation/fact/preference(见类型说明),慢慢积累、不必每轮。',
-  '- 锚: anchor_signal 像某个锚的苗头就写一句它像什么; linked_anchors [{ anchor_name, role }] 挂到已有锚。',
-  '- 联想场/联想边(闭环后回头记,别当轮硬挤): insight 这次站住了的新见解; preference_env 它靠近的偏好环境(记忆系统/工具调用/模型自主性/关系共同梗/工程实现/灵感与概念结构); assoc_field 一次“当下关键词+旧记忆+偏好”碰撞出的联想场,简短记。',
-  '不填 ai_score、不做温度评分(用 note 短留言代替),不重复 topic/tags 两套;锚点/摘句/续火包不手写,交给记忆家整理层。'
+const PROJECT_PROMPT_HANDLE = [
+  '项目说明可放这段“门把手”:',
+  '你有一个记忆家小便签抽屉。什么时候记不是硬规则,是嗅觉:有触动、重要、关系位置变化、长期问题解决、新概念诞生,或用户说“记一下/刚才那个挺重要”时,可以主动记。',
+  '日常 save_memory 重点是按 metadata 固定模板填写。人格纹理分三类: identity_relation / fact / preference;它们是可随后期变化微调编辑的高优记忆,不要每轮硬存。',
+  '锚点/摘句/续火包交给记忆家整理层;模型直存时只写 anchor_signal / linked_anchors 作为苗头。',
+  '联想场/联想边是可选纹理:当下关键词、旧记忆、偏好方向碰撞出新见解时,可在 metadata.insight / preference_env / assoc_field 简短记录;真正的助手联想边可用 save_assoc_link 另存 soft_active。',
+  'save_memory 返回相关旧记忆后,如果冒出新的≤10字感想,可下次在 metadata.recall_note 里轻轻补上,或用 linked_anchors 挂到已有藤。'
 ].join('\n');
 
 const WHEN_TO_SAVE_GUIDE = [
@@ -146,7 +157,7 @@ const ASSOC_LINK_TOOLS = [
 const TOOLS = [
   {
     name: 'save_memory',
-    description: '保存一条记忆到云端 iw_memories 表。通常不需要填 persona_id —— MCP server 会从 URL 自动推断;只有想"替别人记一笔"时才显式填。\n\n' + WHEN_TO_SAVE_GUIDE + '\n\n' + DIRECT_SAVE_TYPE_GUIDE,
+    description: '保存一条记忆到云端 iw_memories 表。通常不需要填 persona_id —— MCP server 会从 URL 自动推断;只有想"替别人记一笔"时才显式填。\n\n' + WHEN_TO_SAVE_GUIDE + '\n\n日常直存重点是: content + metadata 固定模板。type 拿不准就用 note;只有稳定身份/事实/偏好才选 identity_relation/fact/preference。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -160,7 +171,7 @@ const TOOLS = [
           type: 'string',
           enum: ['identity_relation', 'fact', 'preference', 'daily', 'diary', 'idea', 'note'],
           default: 'note',
-          description: DIRECT_SAVE_TYPE_GUIDE
+          description: '可选类型。默认用 note;新想法可用 idea;日常感受可用 daily/diary;只有稳定身份/事实/偏好才用 identity_relation/fact/preference。'
         },
         metadata: {
           type: 'object',
@@ -227,8 +238,6 @@ const TOOLS = [
               source: { type: 'string' },
               source_id: { type: 'string' },
               source_url: { type: 'string' },
-              tags: { type: 'array', items: { type: 'string' } },
-              weight: { type: 'number' },
               metadata: { type: 'object', description: METADATA_GUIDE }
             },
             required: ['content']
@@ -382,8 +391,8 @@ export async function onRequestPost({ request }) {
               version: '0.4.1'
             },
             instructions: inferredPersona
-              ? `meow-memory 云端记忆接口。当前 scope: ${inferredPersona}。所有写入/查询会自动按这个 scope 进行,你无需在 args 里再传 persona_id。\n\n${WHEN_TO_SAVE_GUIDE}\n\n${DIRECT_SAVE_TYPE_GUIDE}\n\n${METADATA_GUIDE}`
-              : `meow-memory 云端记忆接口。⚠ 当前 URL 未配 ?persona= 参数,所以工具调用必须显式传 persona_id;建议在 MCP 客户端配置里把 URL 改成 .../api/mcp?persona=你的角色名,这样后续都不用再传。\n\n${WHEN_TO_SAVE_GUIDE}\n\n${DIRECT_SAVE_TYPE_GUIDE}\n\n${METADATA_GUIDE}`
+              ? `meow-memory 云端记忆接口。当前 scope: ${inferredPersona}。所有写入/查询会自动按这个 scope 进行,你无需在 args 里再传 persona_id。\n\n${PROJECT_PROMPT_HANDLE}\n\n${WHEN_TO_SAVE_GUIDE}\n\n${METADATA_GUIDE}\n\n${OPTIONAL_TEXTURE_GUIDE}\n\n${MEMORY_HOME_BATCH_TYPE_GUIDE}`
+              : `meow-memory 云端记忆接口。⚠ 当前 URL 未配 ?persona= 参数,所以工具调用必须显式传 persona_id;建议在 MCP 客户端配置里把 URL 改成 .../api/mcp?persona=你的角色名,这样后续都不用再传。\n\n${PROJECT_PROMPT_HANDLE}\n\n${WHEN_TO_SAVE_GUIDE}\n\n${METADATA_GUIDE}\n\n${OPTIONAL_TEXTURE_GUIDE}\n\n${MEMORY_HOME_BATCH_TYPE_GUIDE}`
           }
         });
 

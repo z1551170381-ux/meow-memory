@@ -73,9 +73,10 @@ function normalizeMetadata(raw) {
   }
   if (Array.isArray(m.keywords) && m.keywords.length === 0) delete m.keywords;
 
-  // 4. atmosphere 归到 mood(同一个"氛围/感受"别两套)
+  // 4. mood + atmosphere 是固定层字段,都保留。
+  // mood 更短,atmosphere 可补充当时空气;如果只填了 atmosphere,顺手补一个 mood。
   if (m.atmosphere && !m.mood) m.mood = m.atmosphere;
-  delete m.atmosphere;
+  if (typeof m.atmosphere === 'string') m.atmosphere = m.atmosphere.trim();
 
   // 5. note 去首尾空白(短留言, 不硬截断免得切坏意思)
   if (typeof m.note === 'string') m.note = m.note.trim();
