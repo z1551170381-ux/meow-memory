@@ -9,7 +9,7 @@
 
 import { embed, sbMatchMemories, jsonResp, corsPreflight } from './_lib.js';
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
 
 export async function onRequestOptions() {
   return corsPreflight();

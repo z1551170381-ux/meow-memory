@@ -47,7 +47,7 @@ function shapeRelatedRow(row) {
 }
 
 // ★ persona_id 枚举(和 schema.md / 数据库 CHECK 约束保持一致)
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
 
 // ★ 2026-06-03 (老婆+小野): 存记忆时把 metadata 归一成标准格式 —— 代码层一道保险。
 //   提示词/description 管"让 AI 尽量填对", 这里管"填不对也纠正成统一格式",
@@ -73,15 +73,17 @@ function normalizeMetadata(raw) {
   }
   if (Array.isArray(m.keywords) && m.keywords.length === 0) delete m.keywords;
 
-  // 4. mood + atmosphere 是固定层字段,都保留。
-  // mood 更短,atmosphere 可补充当时空气;如果只填了 atmosphere,顺手补一个 mood。
+  // 4. atmosphere 已并入 mood。旧客户端如果还传 atmosphere,用它补 mood 后删掉。
   if (m.atmosphere && !m.mood) m.mood = m.atmosphere;
-  if (typeof m.atmosphere === 'string') m.atmosphere = m.atmosphere.trim();
+  delete m.atmosphere;
 
-  // 5. note 去首尾空白(短留言, 不硬截断免得切坏意思)
+  // 5. summary 已并入 content 的写法要求。旧客户端如果还传 summary,不再存两套。
+  delete m.summary;
+
+  // 6. note 去首尾空白(短留言, 不硬截断免得切坏意思)
   if (typeof m.note === 'string') m.note = m.note.trim();
 
-  // 6. small_weather 是对象时只保留 level/texture 两个标准键
+  // 7. small_weather 是对象时只保留 level/texture 两个标准键
   const sw = m.small_weather;
   if (sw && typeof sw === 'object' && !Array.isArray(sw)) {
     const clean = {};
@@ -128,17 +130,14 @@ export async function onRequestPost(context) {
     }
 
     // 算 embedding
-    // ★ v2.4 (老婆拍板): content + summary 一起算向量。
-    //   小便签场景下模型在 metadata.summary 写 40-90 字事件骨架, 之前只 embed content,
-    //   summary 的关键词进不了向量、搜不到 — 现在拼进去, 标签从"摆设"变"召回燃料"。
+    // ★ 2026-06-03: summary 并入 content 写法;content 第一句承担"浓缩骨架+检索关键词"。
     //   小天气情绪词也一起拼 (轻量), 让"按情绪回忆"也能命中。
     const sw = metadata.small_weather;
     const swText = sw ? (typeof sw === 'string' ? sw : [sw.level, sw.texture].filter(Boolean).join(' ')) : '';
-    // ★ 2026-06-02 (老婆): topic + keywords 也拼进向量 — 标签从"摆设"变"召回燃料",
-    //   省得每次都把关键词重抄进 summary 才搜得到。
+    // ★ 2026-06-02 (老婆): topic + keywords 也拼进向量 — 标签从"摆设"变"召回燃料"。
     const kw = metadata.keywords;
     const kwText = Array.isArray(kw) ? kw.join(' ') : (kw || '');
-    const embedInput = [content, metadata.summary || '', metadata.topic || '', kwText, swText].filter(Boolean).join('\n');
+    const embedInput = [content, metadata.topic || '', kwText, metadata.mood || '', swText].filter(Boolean).join('\n');
     const vector = await embed(embedInput, env);
 
     // 先查相关旧记忆(写入之前,避免查到自己)

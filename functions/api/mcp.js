@@ -18,23 +18,22 @@
 //   - persona_id 改成"可选"(因为 URL 已经有了),tool description 提示"通常不用填"
 //   - cross_persona 仍然保留,想跨 scope 查时显式传
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
 
 const METADATA_GUIDE = [
   'metadata 这才是必填固定格式,严格照此填,不要增减固定层字段:',
+  'content 负责“记事+检索”:第一句写短而具体的浓缩骨架,关键词/人名/概念要齐;后面可补细节。',
   '{',
-  '  "summary": "40-90字事件骨架,把关键词/人名/概念都写进去(会和 content/topic/keywords/small_weather 一起算向量,搜得到)",',
   '  "topic": "具体话题+事件标识,如 reserved slots 真凶定位,不要只写 工程bug",',
   '  "keywords": ["词1", "词2", "词3"],',
-  '  "mood": "当下氛围/感受,一个词或短语",',
-  '  "atmosphere": "氛围补充;没有就填空字符串",',
+  '  "mood": "当下氛围/感受,合并原 atmosphere,一个词或短语",',
   '  "small_weather": { "level": "微风/小雨/起雾/风变大/雷声很近之一或类似强度", "texture": "轻轻/暖/松/隐隐/被接住/刺痛等质地" }',
   '}',
   'note 可选,≤10字当下感受;没有就不填。',
   '锚字段可选: anchor_signal 写一句它像什么; linked_anchors 用 [{ "anchor_name": "...", "role": "..." }] 挂到已有锚。',
   '返记忆感想可选: recall_note 写 save 后看到相关旧记忆时冒出的≤10字新感想,用于在已有藤上轻轻补一句。',
   '联想场字段可选: insight 写这次冒出的新见解; preference_env 写它靠近的偏好环境; assoc_field 写“当下关键词+旧记忆+偏好方向”碰撞出的联想场。',
-  '禁止字段: 不要写 tags、weight、ai_score。不要手写 anchor/quote/continuation_bundle;锚点/摘句/续火包交给记忆家整理层。'
+  '禁止字段: 不要写 summary、atmosphere、tags、weight、ai_score。不要手写 anchor/quote/continuation_bundle;锚点/摘句/续火包交给记忆家整理层。'
 ].join('\n');
 
 const OPTIONAL_TEXTURE_GUIDE = [
@@ -62,7 +61,7 @@ const MEMORY_HOME_BATCH_TYPE_GUIDE = [
 const PROJECT_PROMPT_HANDLE = [
   '项目说明可放这段“门把手”:',
   '你有一个记忆家小便签抽屉。什么时候记不是硬规则,是嗅觉:有触动、重要、关系位置变化、长期问题解决、新概念诞生,或用户说“记一下/刚才那个挺重要”时,可以主动记。',
-  '日常 save_memory 重点是按 metadata 固定模板填写。人格纹理分三类: identity_relation / fact / preference;它们是可随后期变化微调编辑的高优记忆,不要每轮硬存。',
+  '日常 save_memory 重点是 content 写好检索骨架,并按 metadata 固定模板填写。人格纹理分三类: identity_relation / fact / preference;它们是可随后期变化微调编辑的高优记忆,不要每轮硬存。',
   '锚点/摘句/续火包交给记忆家整理层;模型直存时只写 anchor_signal / linked_anchors 作为苗头。',
   '联想场/联想边是可选纹理:当下关键词、旧记忆、偏好方向碰撞出新见解时,可在 metadata.insight / preference_env / assoc_field 简短记录;真正的助手联想边可用 save_assoc_link 另存 soft_active。',
   'save_memory 返回相关旧记忆后,如果冒出新的≤10字感想,可下次在 metadata.recall_note 里轻轻补上,或用 linked_anchors 挂到已有藤。'
@@ -161,7 +160,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        content: { type: 'string', description: '要保存的记忆内容。优先第一人称、短而具体、可独立召回;不要写成“用户说...”。' },
+        content: { type: 'string', description: '要保存的记忆内容。优先第一人称、短而具体、可独立召回;第一句写浓缩骨架并带关键词/人名/概念,后面可补细节;不要写成“用户说...”。' },
         persona_id: {
           type: 'string',
           enum: PERSONA_IDS,
