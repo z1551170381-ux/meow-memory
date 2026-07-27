@@ -18,7 +18,7 @@ import {
   corsPreflight,
 } from './_lib.js';
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
 
 export async function onRequestOptions() {
   return corsPreflight();

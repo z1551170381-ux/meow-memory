@@ -37,7 +37,7 @@ import {
 
 // ★ 已知 persona 白名单 (跟 recall.js 保持一致)
 //   老婆未来加新人物记得这里也加一行
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
 
 // ★ v2.2 type 分类常量 — 单一真相源,所有 filter 都从这里读
 //   ANCHOR_TYPES:    可以作为 group 主锚的类型 (进 bundle.anchors)

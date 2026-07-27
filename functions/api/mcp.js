@@ -18,7 +18,7 @@
 //   - persona_id 改成"可选"(因为 URL 已经有了),tool description 提示"通常不用填"
 //   - cross_persona 仍然保留,想跨 scope 查时显式传
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
 
 const METADATA_GUIDE = [
   'metadata 这才是必填固定格式,严格照此填,不要增减固定层字段:',

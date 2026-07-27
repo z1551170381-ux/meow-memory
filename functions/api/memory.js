@@ -47,7 +47,7 @@ function shapeRelatedRow(row) {
 }
 
 // ★ persona_id 枚举(和 schema.md / 数据库 CHECK 约束保持一致)
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
 
 // ★ 2026-06-03 (老婆+小野): 存记忆时把 metadata 归一成标准格式 —— 代码层一道保险。
 //   提示词/description 管"让 AI 尽量填对", 这里管"填不对也纠正成统一格式",

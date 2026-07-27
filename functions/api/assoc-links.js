@@ -1,6 +1,6 @@
 import { embed, sbHeaders, sbInsertMemory, sbUpdateMemory, jsonResp, corsPreflight } from './_lib.js';
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'system'];
+const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
 const LINK_KINDS = ['assistant_link', 'user_link', 'shared_link'];
 const BLOCK_KIND = 'assistant_link_block';
 const ALL_KINDS = [...LINK_KINDS, BLOCK_KIND];
