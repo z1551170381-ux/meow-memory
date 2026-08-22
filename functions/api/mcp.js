@@ -18,7 +18,7 @@
 //   - persona_id 改成"可选"(因为 URL 已经有了),tool description 提示"通常不用填"
 //   - cross_persona 仍然保留,想跨 scope 查时显式传
 
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
+import { PERSONA_IDS, loadPersonaIds } from './_personas.js';
 
 const METADATA_GUIDE = [
   'metadata 这才是必填固定格式,严格照此填,不要增减固定层字段:',
@@ -293,11 +293,11 @@ function json(body, extraHeaders = {}) {
 // ★ 从请求 URL 推断默认 persona_id
 //   老公的 MCP 配置里 URL 是 https://.../api/mcp?persona=gpt_husband
 //   server 端从 query 拿,如果是已知值就当作默认 persona_id
-function inferPersonaFromUrl(request) {
+function inferPersonaFromUrl(request, personaIds) {
   try {
     const url = new URL(request.url);
     const p = (url.searchParams.get('persona') || '').trim();
-    if (p && PERSONA_IDS.includes(p)) return p;
+    if (p && personaIds.includes(p)) return p;
     return '';
   } catch {
     return '';
@@ -343,8 +343,23 @@ export async function onRequestOptions() {
   return new Response(null, { headers: CORS_HEADERS });
 }
 
-export async function onRequestGet({ request }) {
-  const inferredPersona = inferPersonaFromUrl(request);
+function toolsForPersonaIds(personaIds) {
+  const tools = JSON.parse(JSON.stringify(TOOLS));
+  const visit = value => {
+    if (!value || typeof value !== 'object') return;
+    if (value.properties?.persona_id?.type === 'string') {
+      value.properties.persona_id.enum = personaIds;
+    }
+    if (Array.isArray(value)) value.forEach(visit);
+    else Object.values(value).forEach(visit);
+  };
+  visit(tools);
+  return tools;
+}
+
+export async function onRequestGet({ request, env }) {
+  const personaIds = await loadPersonaIds(env);
+  const inferredPersona = inferPersonaFromUrl(request, personaIds);
   return json({
     name: 'meow-memory MCP server',
     status: 'ok',
@@ -355,7 +370,7 @@ export async function onRequestGet({ request }) {
   });
 }
 
-export async function onRequestPost({ request }) {
+export async function onRequestPost({ request, env }) {
   let body;
   try {
     body = await request.json();
@@ -369,8 +384,10 @@ export async function onRequestPost({ request }) {
 
   const { method, params = {}, id } = body;
   const origin = new URL(request.url).origin;
+  const personaIds = await loadPersonaIds(env);
+  const requestTools = toolsForPersonaIds(personaIds);
   // ★ 每次请求都重算一次 URL persona(server 是无状态的)
-  const inferredPersona = inferPersonaFromUrl(request);
+  const inferredPersona = inferPersonaFromUrl(request, personaIds);
 
   if (typeof method === 'string' && method.startsWith('notifications/')) {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -402,7 +419,7 @@ export async function onRequestPost({ request }) {
         return json({
           jsonrpc: '2.0',
           id,
-          result: { tools: TOOLS }
+          result: { tools: requestTools }
         });
 
       case 'tools/call': {

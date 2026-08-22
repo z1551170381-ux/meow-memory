@@ -7,9 +7,8 @@
 // - persona_id 默认必填(防止误查到老公的记忆给小克用)
 // - 想跨 scope 查必须明确传 cross_persona=true
 
-import { embed, sbMatchMemories, jsonResp, corsPreflight } from './_lib.js';
-
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
+import { embed, sbMatchMemories, sbSelectMemoriesByIds, jsonResp, corsPreflight } from './_lib.js';
+import { PERSONA_IDS, isKnownPersonaId } from './_personas.js';
 
 export async function onRequestOptions() {
   return corsPreflight();
@@ -37,7 +36,7 @@ export async function onRequestPost(context) {
         error: '默认查询必须传 persona_id (' + PERSONA_IDS.join(' / ') + ');真要跨 scope 查请明确传 cross_persona=true',
       }, 400);
     }
-    if (persona_id && !PERSONA_IDS.includes(persona_id)) {
+    if (persona_id && !(await isKnownPersonaId(env, persona_id))) {
       return jsonResp({
         error: 'persona_id 必须是已知值之一: ' + PERSONA_IDS.join(', ') + ',收到: ' + persona_id,
       }, 400);
@@ -50,17 +49,33 @@ export async function onRequestPost(context) {
       filterPersona: cross_persona ? null : persona_id,
     });
 
+    const rows = await sbSelectMemoriesByIds(env, related.map(r => r.id));
+    const rowById = new Map(rows.map(row => [String(row.id), row]));
+
     return jsonResp({
       cross_persona,
       persona_id: cross_persona ? null : persona_id,
-      related: related.map(r => ({
-        id: r.id,
-        content: r.content,
-        type: r.type,
-        persona_id: r.persona_id,  // ★ 返回值带 persona
-        similarity: Math.round(r.similarity * 100) / 100,
-        created_at: r.created_at,
-      })),
+      related: related.map(r => {
+        const row = rowById.get(String(r.id)) || {};
+        const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+        const happenedAt = metadata.happened_at || metadata.manual_date || metadata.message_at || null;
+        const timeKind = metadata.happened_at_kind
+          || (metadata.manual_date ? 'manual_date' : (metadata.message_at ? 'message_at' : (happenedAt ? 'legacy_happened_at' : 'missing')));
+        return {
+          id: r.id,
+          content: r.content,
+          type: r.type,
+          persona_id: r.persona_id,
+          similarity: Math.round(r.similarity * 100) / 100,
+          happened_at: happenedAt,
+          time_kind: timeKind,
+          time_needs_review: metadata.time_needs_review === true || timeKind === 'captured_at_fallback' || timeKind === 'missing',
+          source_id: metadata.source_local_id || metadata.source_id || '',
+          cloud_source_id: metadata.source_id || '',
+          source_url: metadata.source_url || '',
+          created_at: row.created_at || r.created_at || null,
+        };
+      }),
     });
 
   } catch (err) {

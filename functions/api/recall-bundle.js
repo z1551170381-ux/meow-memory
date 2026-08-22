@@ -34,10 +34,7 @@ import {
   jsonResp,
   corsPreflight,
 } from './_lib.js';
-
-// ★ 已知 persona 白名单 (跟 recall.js 保持一致)
-//   老婆未来加新人物记得这里也加一行
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
+import { PERSONA_IDS, isKnownPersonaId } from './_personas.js';
 
 // ★ v2.2 type 分类常量 — 单一真相源,所有 filter 都从这里读
 //   ANCHOR_TYPES:    可以作为 group 主锚的类型 (进 bundle.anchors)
@@ -608,6 +605,8 @@ function collectTopLevelFromRows(rows) {
         source_id: cloudIdOf(x),
         source_url: sourceUrlOf(x),
         happened_at: m.happened_at || x.created_at || null,
+        time_kind: m.happened_at_kind || (m.manual_date ? 'manual_date' : (m.message_at ? 'message_at' : (m.happened_at ? 'legacy_happened_at' : 'missing'))),
+        time_needs_review: m.time_needs_review === true || m.happened_at_kind === 'captured_at_fallback' || (!m.happened_at && !m.manual_date && !m.message_at),
         related_anchors,
         // ★ v2.4 (老婆+小克 2026-05-31): 把记忆家躺在 metadata 里的"藤"读出来返回。
         //   数据一直在云端 (conversation 上云时 tree.js 31413+ 全带了), 只是 bundle 之前没吐出来,
@@ -768,7 +767,7 @@ export async function onRequestPost(context) {
         error: '默认查询必须传 persona_id (' + PERSONA_IDS.join(' / ') + ');真要跨 scope 查请明确传 cross_persona=true',
       }, 400);
     }
-    if (persona_id && !PERSONA_IDS.includes(persona_id)) {
+    if (persona_id && !(await isKnownPersonaId(env, persona_id))) {
       return jsonResp({
         error: 'persona_id 必须是已知值之一: ' + PERSONA_IDS.join(', ') + ',收到: ' + persona_id,
       }, 400);

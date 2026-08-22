@@ -1,6 +1,5 @@
 import { embed, sbHeaders, sbInsertMemory, sbUpdateMemory, jsonResp, corsPreflight } from './_lib.js';
-
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
+import { isKnownPersonaId } from './_personas.js';
 const LINK_KINDS = ['assistant_link', 'user_link', 'shared_link'];
 const BLOCK_KIND = 'assistant_link_block';
 const ALL_KINDS = [...LINK_KINDS, BLOCK_KIND];
@@ -23,9 +22,9 @@ function metaOf(row) {
   return row && typeof row.metadata === 'object' && row.metadata ? row.metadata : {};
 }
 
-function validatePersona(personaId) {
+async function validatePersona(env, personaId) {
   const p = cleanText(personaId, 80);
-  if (!p || !PERSONA_IDS.includes(p)) throw new Error('persona_id is required');
+  if (!p || !(await isKnownPersonaId(env, p))) throw new Error('persona_id is required');
   return p;
 }
 
@@ -128,7 +127,7 @@ function scoreLink(row, text) {
 }
 
 async function suggestLinks(env, body) {
-  const personaId = validatePersona(body.persona_id);
+  const personaId = await validatePersona(env, body.persona_id);
   const text = cleanText(body.text || body.query, 5000);
   if (!text) throw new Error('text is required');
 
@@ -169,7 +168,7 @@ async function suggestLinks(env, body) {
 }
 
 async function saveLink(env, body) {
-  const personaId = validatePersona(body.persona_id);
+  const personaId = await validatePersona(env, body.persona_id);
   const assocKind = inferKind(body.assoc_kind || body.kind);
   const triggers = asArray(body.triggers || body.trigger || body.cues);
   const target = cleanText(body.target, 500);
@@ -215,7 +214,7 @@ async function strengthenLink(env, body) {
   const id = cleanText(body.id, 120);
   if (!id) throw new Error('id is required');
 
-  const rows = await fetchAssocRows(env, validatePersona(body.persona_id), {
+  const rows = await fetchAssocRows(env, await validatePersona(env, body.persona_id), {
     include_deleted: true,
     limit: body.limit || 500,
   });
@@ -238,7 +237,7 @@ async function strengthenLink(env, body) {
 }
 
 async function listLinks(env, body) {
-  const personaId = validatePersona(body.persona_id);
+  const personaId = await validatePersona(env, body.persona_id);
   const rows = await fetchAssocRows(env, personaId, {
     include_deleted: body.include_deleted === true,
     kinds: body.include_blocks === false ? LINK_KINDS : ALL_KINDS,

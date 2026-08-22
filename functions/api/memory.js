@@ -8,6 +8,7 @@
 // - 写入和召回都带 persona
 
 import { embed, sbInsertMemory, sbMatchMemories, sbSelectMemoriesByIds, jsonResp, corsPreflight } from './_lib.js';
+import { PERSONA_IDS, isKnownPersonaId } from './_personas.js';
 
 // ★ v2.4 (老婆+小克 2026-05-31): 把记忆家躺在 metadata 里的"藤"塑形成中等档返回。
 //   存记忆是用得最多的路径, 但之前 save 完只返回 3 条裸 content, 看不到一句话总结/
@@ -45,9 +46,6 @@ function shapeRelatedRow(row) {
     content_preview:  m.one_line ? '' : cut(row.content, 160),
   };
 }
-
-// ★ persona_id 枚举(和 schema.md / 数据库 CHECK 约束保持一致)
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
 
 // ★ 2026-06-03 (老婆+小野): 存记忆时把 metadata 归一成标准格式 —— 代码层一道保险。
 //   提示词/description 管"让 AI 尽量填对", 这里管"填不对也纠正成统一格式",
@@ -123,7 +121,7 @@ export async function onRequestPost(context) {
         error: 'persona_id 必填。可选值: ' + PERSONA_IDS.join(', '),
       }, 400);
     }
-    if (!PERSONA_IDS.includes(persona_id)) {
+    if (!(await isKnownPersonaId(env, persona_id))) {
       return jsonResp({
         error: 'persona_id 必须是已知值之一: ' + PERSONA_IDS.join(', ') + ',收到: ' + persona_id,
       }, 400);

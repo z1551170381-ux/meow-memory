@@ -17,8 +17,7 @@ import {
   jsonResp,
   corsPreflight,
 } from './_lib.js';
-
-const PERSONA_IDS = ['gpt_husband', 'weave_brother', 'junior', 'claude_xiaoke', 'xiaoye', 'butler', 'cbao', 'kk', 'codex_xiaoke', 'system'];
+import { PERSONA_IDS, isKnownPersonaId } from './_personas.js';
 
 export async function onRequestOptions() {
   return corsPreflight();
@@ -93,7 +92,7 @@ export async function onRequestPost(context) {
           error: '批量上传必须指定 persona_id:顶层 body 里传一个统一值,或每条 item 内单独传。可选值: ' + PERSONA_IDS.join(', '),
         }, 400);
       }
-    } else if (!PERSONA_IDS.includes(topPersonaId)) {
+    } else if (!(await isKnownPersonaId(env, topPersonaId))) {
       return jsonResp({
         error: '顶层 persona_id 必须是已知值之一: ' + PERSONA_IDS.join(', ') + ',收到: ' + topPersonaId,
       }, 400);
@@ -119,7 +118,7 @@ export async function onRequestPost(context) {
           failed.push({ index: i, error: 'persona_id 缺失' });
           continue;
         }
-        if (!PERSONA_IDS.includes(itemPersonaId)) {
+        if (!(await isKnownPersonaId(env, itemPersonaId))) {
           failed.push({ index: i, error: 'persona_id 必须是已知值之一: ' + PERSONA_IDS.join(', ') + ',收到: ' + itemPersonaId });
           continue;
         }
@@ -180,7 +179,7 @@ export async function onRequestPost(context) {
               content,
               type: itemType,
               persona_id: itemPersonaId,  // ★ 顶层列也更新
-              metadata,
+              metadata: { ...(existing.metadata || {}), ...metadata },
               embedding: vector,
             });
             action = 'updated';
